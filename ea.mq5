@@ -1,14 +1,17 @@
 #property strict
-#property version "4.30"
+#property version "4.31"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-input string API           = "http://127.0.0.1:3001/pull";
-input int    POLL_SECONDS  = 1;
-input long   MAGIC         = 2501153001;
-input string COMMENT_TXT   = "tg-signal";
-input bool   DEBUG_LOG     = true;
+input string API                = "http://127.0.0.1:3001/pull";
+input int    POLL_SECONDS       = 1;
+input long   MAGIC              = 2501153001;
+input string COMMENT_TXT        = "";
+input bool   DEBUG_LOG          = true;
+
+// ===== NEW: Expiration for LIMIT orders (hours) =====
+input int    LIMIT_EXPIRY_HOURS = 3;
 
 long g_last_login = -1;
 datetime g_last_poll = 0;
@@ -277,10 +280,8 @@ void OnDeinit(const int reason)
 //================ CHART EVENT =================//
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
 {
-   // nếu chart/symbol bị thay đổi do account switch, đảm bảo chart sống
    EnsureChartSymbolAlive();
 
-   // rearm timer cho chắc
    EventKillTimer();
    EventSetTimer(POLL_SECONDS);
 
@@ -293,12 +294,10 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
 //================ TIMER =================//
 void OnTimer()
 {
-   // throttle
    datetime now = TimeCurrent();
    if(now - g_last_poll < POLL_SECONDS) return;
    g_last_poll = now;
 
-   // nếu account đổi: đảm bảo chart symbol tồn tại + reset magic
    long login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
    if(login != g_last_login)
    {
@@ -329,7 +328,6 @@ void OnTimer()
       return;
    }
 
-   // resolve symbol theo account hiện tại
    string tradeSymbol = ResolveSignalSymbol(symbol);
    if(tradeSymbol == "")
    {
@@ -346,6 +344,11 @@ void OnTimer()
 
    Log(StringFormat("SIGNAL %s %s orders=%d", tradeSymbol, type, count));
 
+   // ===== NEW: expiration time for LIMIT orders =====
+   datetime expiry = 0;
+   if(LIMIT_EXPIRY_HOURS > 0)
+      expiry = (datetime)(TimeCurrent() + (long)LIMIT_EXPIRY_HOURS * 3600);
+
    for(int i=0;i<count;i++)
    {
       double entry = GetArrayDouble(json, "orders", i, "entry");
@@ -361,10 +364,26 @@ void OnTimer()
 
       bool ok=false;
 
+      // Prefer ORDER_TIME_SPECIFIED if LIMIT_EXPIRY_HOURS > 0, else GTC
+      ENUM_ORDER_TYPE_TIME ttype = (LIMIT_EXPIRY_HOURS > 0 ? ORDER_TIME_SPECIFIED : ORDER_TIME_GTC);
+      datetime texpires = (LIMIT_EXPIRY_HOURS > 0 ? expiry : (datetime)0);
+
       if(type == "BUY_LIMIT")
-         ok = trade.BuyLimit(lot, entry, tradeSymbol, sl, tp, ORDER_TIME_GTC, 0, COMMENT_TXT);
+      {
+         ok = trade.BuyLimit(lot, entry, tradeSymbol, sl, tp, ttype, texpires, COMMENT_TXT);
+
+         // Fallback: if broker rejects SPECIFIED, try GTC
+         if(!ok && ttype == ORDER_TIME_SPECIFIED)
+            ok = trade.BuyLimit(lot, entry, tradeSymbol, sl, tp, ORDER_TIME_GTC, 0, COMMENT_TXT);
+      }
       else if(type == "SELL_LIMIT")
-         ok = trade.SellLimit(lot, entry, tradeSymbol, sl, tp, ORDER_TIME_GTC, 0, COMMENT_TXT);
+      {
+         ok = trade.SellLimit(lot, entry, tradeSymbol, sl, tp, ttype, texpires, COMMENT_TXT);
+
+         // Fallback: if broker rejects SPECIFIED, try GTC
+         if(!ok && ttype == ORDER_TIME_SPECIFIED)
+            ok = trade.SellLimit(lot, entry, tradeSymbol, sl, tp, ORDER_TIME_GTC, 0, COMMENT_TXT);
+      }
 
       if(!ok)
          Log(StringFormat("TRADE FAIL ret=%d %s lastErr=%d",
@@ -372,6 +391,9 @@ void OnTimer()
                           trade.ResultRetcodeDescription(),
                           GetLastError()));
       else
-         Log(StringFormat("TRADE OK ticket=%I64d", trade.ResultOrder()));
+      {
+         string expTxt = (LIMIT_EXPIRY_HOURS > 0 ? TimeToString(expiry, TIME_DATE|TIME_SECONDS) : "GTC");
+         Log(StringFormat("TRADE OK ticket=%I64d | expiry=%s", trade.ResultOrder(), expTxt));
+      }
    }
 }

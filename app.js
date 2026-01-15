@@ -125,6 +125,10 @@ app.get("/pull", (req, res) => {
   res.json(queue.shift());
 });
 
+app.get("/ping", (req, res) => {
+  return res.send("pong");
+});
+
 app.listen(3001, () => {
   console.log("Signal server running at http://127.0.0.1:3001");
 });

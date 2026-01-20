@@ -12,11 +12,11 @@ let queue = [];
 
 function parseSignal(text) {
   // ---- SYMBOL: không phân biệt hoa/thường ----
+  // Nếu không match được symbol -> mặc định XAUUSD
   const symbolMatch = text.match(/^(xauusd[a-z]?|[a-z]{6})/i);
-  if (!symbolMatch) return null;
 
   // chuẩn hoá symbol về IN HOA (EA xử lý suffix sau)
-  const symbol = symbolMatch[1].toUpperCase();
+  const symbol = (symbolMatch ? symbolMatch[1] : "XAUUSD").toUpperCase();
 
   // ---- TYPE ----
   const upperText = text.toUpperCase();
@@ -32,8 +32,8 @@ function parseSignal(text) {
   if (!entryMatch) return null;
   const entries = entryMatch[1]
     .split("-")
-    .map(v => parseFloat(v.trim()))
-    .filter(v => !isNaN(v));
+    .map((v) => parseFloat(v.trim()))
+    .filter((v) => !isNaN(v));
 
   // ---- SL ----
   const slMatch = text.match(/🛑:\s*([\d.]+)/);
@@ -45,7 +45,7 @@ function parseSignal(text) {
   if (!tpMatch) return null;
   const tps = tpMatch[1]
     .split("-")
-    .map(v => parseFloat(v.trim()));
+    .map((v) => parseFloat(v.trim()));
 
   // ---- LOT / RISK ----
   const lotMatch = text.match(/@[\d.]+,\s*([\d.,\s]+)/);
@@ -53,8 +53,8 @@ function parseSignal(text) {
 
   const nums = lotMatch[1]
     .split(",")
-    .map(v => parseFloat(v.trim()))
-    .filter(v => !isNaN(v));
+    .map((v) => parseFloat(v.trim()))
+    .filter((v) => !isNaN(v));
 
   let lots = nums.slice(0, entries.length);
   const hasTotalRisk = nums.length === entries.length + 1;
@@ -73,11 +73,7 @@ function parseSignal(text) {
     });
 
     lots = entries.map((entry, i) => {
-      const distance =
-        type === "SELL_LIMIT"
-          ? sl - entry
-          : entry - sl;
-
+      const distance = type === "SELL_LIMIT" ? sl - entry : entry - sl;
       if (distance <= 0) return 0;
 
       // XAUUSD: 1 lot = 100 USD / 1 giá
@@ -89,15 +85,15 @@ function parseSignal(text) {
   const orders = entries.map((entry, i) => ({
     entry,
     tp: tps[i],
-    lot: lots[i]
+    lot: lots[i],
   }));
 
   return {
-    symbol,          // luôn IN HOA
+    symbol,
     type,
     sl,
     orders,
-    createdAt: Date.now()
+    createdAt: Date.now(),
   };
 }
 

@@ -35,20 +35,26 @@ function parseSignal(text) {
     .map((v) => parseFloat(v.trim()))
     .filter((v) => !isNaN(v));
 
+  if (!entries.length) return null;
+
   // ---- SL ----
   const slMatch = text.match(/🛑:\s*([\d.]+)/);
   if (!slMatch) return null;
   const sl = parseFloat(slMatch[1]);
+  if (isNaN(sl)) return null;
 
   // ---- TP ----
   const tpMatch = text.match(/🎯:\s*([\d.\s-]+)/);
   if (!tpMatch) return null;
   const tps = tpMatch[1]
     .split("-")
-    .map((v) => parseFloat(v.trim()));
+    .map((v) => parseFloat(v.trim()))
+    .filter((v) => !isNaN(v));
 
-  // ---- LOT / RISK ----
-  // Only accept: @price, totalRisk[, lot1, lot2, ...]
+  // ---- LOT / RISK (NEW FORMAT) ----
+  // Only treat as: @price, totalRisk[, lot1, lot2, ...]
+  // If lots are provided after totalRisk and enough for all entries -> use them
+  // Else -> compute lots from totalRisk
   const lotMatch = text.match(/@[\d.]+,\s*([\d.,\s]+)/);
   if (!lotMatch) return null;
 
@@ -60,24 +66,22 @@ function parseSignal(text) {
   const n = entries.length;
   if (nums.length < 1) return null;
 
-  const totalRisk = nums[0];          // ✅ NEW FORMAT: first number is totalRisk
+  const totalRisk = nums[0]; // ✅ NEW FORMAT: totalRisk is first
   const lotsCandidate = nums.slice(1);
-
-  // ❌ Reject old format risk-last: @price, lot1, lot2, lot3, totalRisk
-  // If user provides lots first (usually small) and last is big risk -> reject
-  if (lotsCandidate.length >= n && totalRisk < 5 && lotsCandidate[lotsCandidate.length - 1] >= 5) {
-    return null;
-  }
 
   let lots = [];
 
   // If user provides enough lots after totalRisk -> use them
   if (lotsCandidate.length >= n) {
-    lots = lotsCandidate.slice(0, n);
+    lots = lotsCandidate.slice(0, n).map((x) => Number(x.toFixed(3)));
   } else {
-    // Otherwise compute lots from totalRisk (80/20 like your current logic)
+    // Otherwise compute lots from totalRisk
     let risks = [];
 
+    // phân bổ risk:
+    // 1 entry: 100%
+    // 2 entries: 50/50
+    // >=3 entries: 40/40/20 (giữ đúng logic cũ của bạn)
     if (n === 1) {
       risks = [totalRisk];
     } else if (n === 2) {
@@ -90,7 +94,7 @@ function parseSignal(text) {
       risks = entries.map((_, i) => {
         if (i === 0 || i === 1) return riskEachFirst;
         if (i === n - 1) return riskLast;
-        return 0;
+        return 0; // nếu n > 3, entry ở giữa để 0 như logic cũ
       });
     }
 
@@ -104,31 +108,12 @@ function parseSignal(text) {
     });
   }
 
-  /* ===== RISK MODE 80 / 20 ===== */
-  if (totalRisk && entries.length >= 3) {
-    const riskFirstTwo = totalRisk * 0.8;
-    const riskEachFirst = riskFirstTwo / 2;
-    const riskLast = totalRisk * 0.2;
-
-    const risks = entries.map((_, i) => {
-      if (i === 0 || i === 1) return riskEachFirst;
-      if (i === entries.length - 1) return riskLast;
-      return 0;
-    });
-
-    lots = entries.map((entry, i) => {
-      const distance = type === "SELL_LIMIT" ? sl - entry : entry - sl;
-      if (distance <= 0) return 0;
-
-      // XAUUSD: 1 lot = 100 USD / 1 giá
-      const lot = risks[i] / (distance * 100);
-      return Math.max(0, Number(lot.toFixed(3)));
-    });
-  }
+  // đảm bảo lots đúng độ dài n
+  lots = Array.from({ length: n }, (_, i) => (typeof lots[i] === "number" ? lots[i] : 0));
 
   const orders = entries.map((entry, i) => ({
     entry,
-    tp: tps[i],
+    tp: typeof tps[i] === "number" ? tps[i] : null,
     lot: lots[i],
   }));
 
@@ -144,15 +129,14 @@ function parseSignal(text) {
 /* ================= TELEGRAM BOT ================= */
 
 bot.on("text", (ctx) => {
-  if (
-    ctx.from.id !== ALLOWED_USER_ID ||
-    ctx.chat.id !== ALLOWED_USER_ID
-  ) return;
+  if (ctx.from.id !== ALLOWED_USER_ID || ctx.chat.id !== ALLOWED_USER_ID) return;
 
   const signal = parseSignal(ctx.message.text);
   if (!signal) return;
 
+  // ✅ dùng thật thì bật dòng này để MT5 pull được
   // queue.push(signal);
+
   console.log("Queued signal:\n", JSON.stringify(signal, null, 2));
 });
 

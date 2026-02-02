@@ -2,9 +2,10 @@
 #property version "4.31"
 
 #include <Trade/Trade.mqh>
+
 CTrade trade;
 
-input string API                = "http://127.0.0.1:3001/pull";
+input string API                = "http://localhost/pull";
 input int    POLL_SECONDS       = 1;
 input long   MAGIC              = 2501153001;
 input string COMMENT_TXT        = "";
@@ -51,7 +52,7 @@ string Trim(string s)
 string PickSafeChartSymbol()
 {
    // ưu tiên: XAUUSDc / XAUUSD / GOLD / EURUSD
-   string prefer[4] = {"XAUUSDc","XAUUSD","GOLD","EURUSD"};
+   string prefer[4] = {"XAUUSD","XAUUSDc", "XAUUSD.sml", "GOLD"};
    for(int i=0;i<4;i++)
    {
       if(SymbolExists(prefer[i]))

@@ -117,6 +117,18 @@ function parseSignal(text) {
     lot: lots[i],
   }));
 
+  // ✅ MERGE nếu 2 entry đầu giống nhau
+  if (orders.length >= 2 && orders[0].entry === orders[1].entry) {
+    const mergedOrder = {
+      entry: orders[0].entry,
+      lot: Number((orders[0].lot + orders[1].lot).toFixed(3)),
+      tp: orders[1].tp ?? orders[0].tp, // ưu tiên TP lệnh 2
+    };
+
+    // giữ lại các lệnh còn lại (từ index 2 trở đi)
+    orders = [mergedOrder, ...orders.slice(2)];
+  }
+
   return {
     symbol,
     type,

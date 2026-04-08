@@ -136,6 +136,7 @@ bot.on("text", (ctx) => {
 
   // ✅ dùng thật thì bật dòng này để MT5 pull được
   queue.push(signal);
+  ctx.reply(JSON.stringify(signal, null, 2));
 
   // console.log("Queued signal:\n", JSON.stringify(signal, null, 2));
 });

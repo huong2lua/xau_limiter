@@ -141,9 +141,7 @@ function parseSignal(text) {
 /* ================= TELEGRAM BOT ================= */
 
 function formatSignal(signal) {
-  let text = `📡 SIGNAL RECEIVED\n\n`;
-  text += `Symbol: ${signal.symbol}\n`;
-  text += `Type: ${signal.type.replace("_", " ")}\n\n`;
+  let text = `📡: ${signal.symbol}\n`;
   text += `🛑 SL: ${signal.sl}\n\n`;
 
   signal.orders.forEach((o, i) => {

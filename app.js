@@ -111,7 +111,7 @@ function parseSignal(text) {
   // đảm bảo lots đúng độ dài n
   lots = Array.from({ length: n }, (_, i) => (typeof lots[i] === "number" ? lots[i] : 0));
 
-  const orders = entries.map((entry, i) => ({
+  let orders = entries.map((entry, i) => ({
     entry,
     tp: typeof tps[i] === "number" ? tps[i] : null,
     lot: lots[i],

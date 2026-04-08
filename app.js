@@ -140,6 +140,21 @@ function parseSignal(text) {
 
 /* ================= TELEGRAM BOT ================= */
 
+function formatSignal(signal) {
+  let text = `📡 SIGNAL RECEIVED\n\n`;
+  text += `Symbol: ${signal.symbol}\n`;
+  text += `Type: ${signal.type.replace("_", " ")}\n\n`;
+  text += `🛑 SL: ${signal.sl}\n\n`;
+
+  signal.orders.forEach((o, i) => {
+    text += `📥 Entry ${i + 1}: ${o.entry}\n`;
+    text += `   • Lot: ${o.lot}\n`;
+    text += `   • TP: ${o.tp ?? "N/A"}\n\n`;
+  });
+
+  return text.trim();
+}
+
 bot.on("text", (ctx) => {
   if (ctx.from.id !== ALLOWED_USER_ID || ctx.chat.id !== ALLOWED_USER_ID) return;
 
@@ -148,7 +163,7 @@ bot.on("text", (ctx) => {
 
   // ✅ dùng thật thì bật dòng này để MT5 pull được
   queue.push(signal);
-  ctx.reply(JSON.stringify(signal, null, 2));
+  ctx.reply(formatSignal(signal));
 
   // console.log("Queued signal:\n", JSON.stringify(signal, null, 2));
 });

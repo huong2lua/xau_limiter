@@ -161,7 +161,9 @@ bot.on("text", (ctx) => {
 
   // ✅ dùng thật thì bật dòng này để MT5 pull được
   queue.push(signal);
-  ctx.reply(formatSignal(signal));
+  ctx.reply(formatSignal(signal), {
+    reply_to_message_id: ctx.message.message_id, // ✅ QUOTE CHÍNH XÁC
+  });
 
   // console.log("Queued signal:\n", JSON.stringify(signal, null, 2));
 });

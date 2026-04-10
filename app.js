@@ -156,6 +156,15 @@ function formatSignal(signal) {
 bot.on("text", (ctx) => {
   if (ctx.from.id !== ALLOWED_USER_ID || ctx.chat.id !== ALLOWED_USER_ID) return;
 
+  const text = ctx.message.text.trim().toLowerCase();
+
+  // ✅ CLEAR QUEUE (chỉ react)
+  if (text === "clear") {
+    queue = [];
+    ctx.react("👍"); // like message
+    return;
+  }
+
   const signal = parseSignal(ctx.message.text);
   if (!signal) return;
 

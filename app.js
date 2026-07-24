@@ -175,7 +175,7 @@ bot.on("text", (ctx) => {
       type: "SET_BE",
     };
 
-    signalQueue.push(signal);
+    queue.push(signal);
 
     console.log("SET BE QUEUED:", signal);
 

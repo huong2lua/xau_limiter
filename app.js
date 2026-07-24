@@ -156,17 +156,16 @@ function formatSignal(signal) {
 bot.on("text", (ctx) => {
   if (ctx.from.id !== ALLOWED_USER_ID || ctx.chat.id !== ALLOWED_USER_ID) return;
 
-  const text = ctx.message.text.trim().toLowerCase();
+  const normalizedText = ctx.message.text.trim().toLowerCase();
 
   // ✅ CLEAR QUEUE (chỉ react)
-  if (text === "clear") {
+  if (normalizedText === "clear") {
     queue = [];
     ctx.react("👍"); // like message
     return;
   }
   //================ BREAK EVEN =================//
-  if (
-  normalizedText === "be" ||
+  if (normalizedText === "be" ||
   normalizedText === "/be" ||
   normalizedText === "set be" ||
   normalizedText === "set_be"
@@ -187,7 +186,7 @@ bot.on("text", (ctx) => {
     return;
   }
 
-  const signal = parseSignal(ctx.message.text);
+  const signal = parseSignal(normalizedText);
   if (!signal) return;
 
   // ✅ dùng thật thì bật dòng này để MT5 pull được

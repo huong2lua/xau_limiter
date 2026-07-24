@@ -1108,8 +1108,21 @@ void OnDeinit(const int reason)
    );
 }
 
-//================ TIMER =================//
+//================ CHART EVENT =================//
+void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
+{
+   EnsureChartSymbolAlive();
 
+   EventKillTimer();
+   EventSetTimer(POLL_SECONDS);
+
+   g_last_poll = 0;
+
+   if(DEBUG_LOG)
+      Log(StringFormat("CHART EVENT id=%d -> rearm timer", id));
+}
+
+//================ TIMER =================//
 void OnTimer()
 {
    datetime now = TimeCurrent();

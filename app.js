@@ -170,19 +170,9 @@ bot.on("text", (ctx) => {
   normalizedText === "set be" ||
   normalizedText === "set_be"
   ) {
-    const signal = {
-      symbol: "XAUUSD",
-      type: "SET_BE",
-    };
-
+    const signal = { symbol: "XAUUSD", type: "SET_BE" };
     queue.push(signal);
-
-    console.log("SET BE QUEUED:", signal);
-
-    ctx.reply(
-      "Đã gửi yêu cầu chuyển các vị thế XAUUSD sang BE."
-    );
-
+    ctx.reply("BE DONE.");
     return;
   }
 

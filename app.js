@@ -180,7 +180,7 @@ bot.on("text", (ctx) => {
 
     console.log("SET BE QUEUED:", signal);
 
-    await ctx.reply(
+    ctx.reply(
       "Đã gửi yêu cầu chuyển các vị thế XAUUSD sang BE."
     );
 

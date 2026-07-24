@@ -175,7 +175,52 @@ bot.on("text", (ctx) => {
     ctx.react("👍"); // like message
     return;
   }
+  //================ SET SL HÀNG LOẠT =================//
 
+  const slMatch = normalizedText.match(
+    /^\/?sl\s+(\d+(?:[.,]\d+)?)$/i
+  );
+
+  if (slMatch) {
+    const price = Number(
+      slMatch[1].replace(",", ".")
+    );
+
+    if (!Number.isFinite(price) || price <= 0) {
+      ctx.reply("Giá SL không hợp lệ.");
+      return;
+    }
+
+    const signal = { symbol: "XAUUSD", type: "SET_SL", price };
+
+    queue.push(signal);
+    ctx.react("👍"); // like message
+    return;
+  }
+
+  //================ SET TP HÀNG LOẠT =================//
+
+  const tpMatch = normalizedText.match(
+    /^\/?tp\s+(\d+(?:[.,]\d+)?)$/i
+  );
+
+  if (tpMatch) {
+    const price = Number(
+      tpMatch[1].replace(",", ".")
+    );
+
+    if (!Number.isFinite(price) || price <= 0) {
+      ctx.reply("Giá TP không hợp lệ.");
+      return;
+    }
+
+    const signal = { symbol: "XAUUSD", type: "SET_TP", price };
+    queue.push(signal);
+    ctx.react("👍"); // like message
+    return;
+  }  
+
+/* ================= BUY SELL LIMIT ================= */
   const signal = parseSignal(normalizedText);
   if (!signal) return;
 

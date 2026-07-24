@@ -172,7 +172,7 @@ bot.on("text", (ctx) => {
   ) {
     const signal = { symbol: "XAUUSD", type: "SET_BE" };
     queue.push(signal);
-    ctx.reply("BE DONE.");
+    ctx.react("👍"); // like message
     return;
   }
 

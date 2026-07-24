@@ -164,6 +164,28 @@ bot.on("text", (ctx) => {
     ctx.react("👍"); // like message
     return;
   }
+  //================ BREAK EVEN =================//
+  if (
+  normalizedText === "be" ||
+  normalizedText === "/be" ||
+  normalizedText === "set be" ||
+  normalizedText === "set_be"
+  ) {
+    const signal = {
+      symbol: "XAUUSD",
+      type: "SET_BE",
+    };
+
+    signalQueue.push(signal);
+
+    console.log("SET BE QUEUED:", signal);
+
+    await ctx.reply(
+      "Đã gửi yêu cầu chuyển các vị thế XAUUSD sang BE."
+    );
+
+    return;
+  }
 
   const signal = parseSignal(ctx.message.text);
   if (!signal) return;

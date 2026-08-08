@@ -271,15 +271,48 @@ tcpServer.listen(TCP_PORT, TCP_HOST, () => {
 
 /* ================= TELEGRAM BOT ================= */
 
+function getRTargets(signal, order, maxR = 5) {
+  const riskDistance = Math.abs(signal.sl - order.entry);
+
+  if (!Number.isFinite(riskDistance) || riskDistance <= 0) {
+    return [];
+  }
+
+  return Array.from({ length: maxR }, (_, i) => {
+    const r = i + 1;
+
+    const price =
+      signal.type === "SELL_LIMIT"
+        ? order.entry - riskDistance * r
+        : order.entry + riskDistance * r;
+
+    return {
+      r,
+      price: price.toFixed(3),
+    };
+  });
+}
+
+function c(value) {
+  return `<code>${value}</code>`;
+}
+
 function formatSignal(signal, delivered) {
   let text = `📡: ${signal.symbol}\n`;
-  text += `🛑 SL: ${signal.sl}\n`;
+  text += `🛑 ${c(`SL ` +signal.sl)}\n`;
   text += `🖥 EA nhận: ${delivered}\n\n`;
 
   signal.orders.forEach((order, index) => {
-    text += `📥 Entry ${index + 1}: ${order.entry}\n`;
-    text += `   • Lot: ${order.lot}\n`;
-    text += `   • TP: ${order.tp ?? "N/A"}\n\n`;
+    const rTargets = getRTargets(signal, order, 5);
+
+    const rText = rTargets
+      .map((item) => `${item.r}R: ${c(item.price)}`)
+      .join(" | ");
+
+    text += `📥 Entry ${index + 1}: ${c(order.entry)}\n`;
+    text += `   • Lot: ${c(order.lot)}\n`;
+    text += `   • TP: ${c(order.tp ?? "N/A")}\n`;
+    text += `   • ${rText}\n\n`;
   });
 
   return text.trim();
@@ -391,6 +424,7 @@ bot.on("text", async (ctx) => {
 
   await ctx.reply(formatSignal(signal, delivered), {
     reply_to_message_id: ctx.message.message_id,
+    parse_mode: "HTML",
   });
 });
 

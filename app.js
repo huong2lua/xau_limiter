@@ -1309,15 +1309,17 @@ async function start() {
 
   /* ---------------- Telegram Bot ---------------- */
 
-  await bot.launch();
+  bot.launch().catch((error) => {
+    console.error(
+      "Telegram bot launch error:",
+      error?.message || error
+    );
 
-  console.log(
-    "🤖 Telegram bot running"
-  );
+    process.exit(1);
+  });
 
-  console.log(
-    "✅ Combined app started successfully"
-  );
+  console.log("🤖 Telegram bot running");
+  console.log("✅ Combined app started successfully");
 }
 
 /* ============================================================

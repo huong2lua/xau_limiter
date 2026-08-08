@@ -298,23 +298,7 @@ function c(value) {
 }
 
 function formatSignal(signal, delivered) {
-  let text = `📡: ${signal.symbol}\n`;
-  text += `🛑 ${c(`SL ` +signal.sl)}\n`;
-  text += `🖥 EA nhận: ${delivered}\n\n`;
-
-  signal.orders.forEach((order, index) => {
-    const rTargets = getRTargets(signal, order, 5);
-
-    const rText = rTargets
-      .map((item) => `${item.r}R: ${c(item.price)}`)
-      .join(" | ");
-
-    text += `📥 Entry ${index + 1}: ${c(order.entry)}\n`;
-    text += `   • Lot: ${c(order.lot)}\n`;
-    text += `   • TP: ${c(order.tp ?? "N/A")}\n`;
-    text += `   • ${rText}\n\n`;
-  });
-
+  let text = `📡 ${signal.symbol}  |  🖥 EA nhận: ${delivered}`;
   return text.trim();
 }
 
@@ -422,9 +406,61 @@ bot.on("text", async (ctx) => {
 
   const delivered = broadcastSignal(signal);
 
+  const keyboard = [];
+
+  signal.orders.forEach((order, index) => {
+    const rTargets = getRTargets(signal, order, 5);
+    const tpx = `TP `;
+
+    keyboard.push([
+      {
+        text: `📥 E${index + 1} ${order.entry}`,
+        copy_text: { text: String(order.entry), },
+      },
+      {
+        text: `🎯 TP ${order.tp ?? "N/A"}`,
+        copy_text: { text: tpx + String(order.tp ?? ""), },
+      },
+    ]);
+
+    keyboard.push([
+      {
+        text: `1R ${rTargets[0].price}`,
+        copy_text: { text: tpx + rTargets[0].price, },
+      },
+      {
+        text: `2R ${rTargets[1].price}`,
+        copy_text: { text: tpx + rTargets[1].price, },
+      },
+    ]);
+
+    keyboard.push([
+      {
+        text: `3R ${rTargets[2].price}`,
+        copy_text: { text: tpx + rTargets[2].price, },
+      },
+      {
+        text: `5R ${rTargets[4].price}`,
+        copy_text: { text: tpx + rTargets[4].price, },
+      },
+    ]);
+  });
+
+  keyboard.push([
+    {
+      text: `🛑 SL ${signal.sl}`,
+      copy_text: {
+        text: `SL ` + String(signal.sl),
+      },
+    },
+  ]);
+
   await ctx.reply(formatSignal(signal, delivered), {
     reply_to_message_id: ctx.message.message_id,
     parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: keyboard,
+    },
   });
 });
 

@@ -1,122 +1,451 @@
 require("dotenv").config();
+
 const { Telegraf } = require("telegraf");
+const { TelegramClient } = require("telegram");
+const { StringSession } = require("telegram/sessions");
 const express = require("express");
 const net = require("net");
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const app = express();
+/* ============================================================
+   CONFIG
+============================================================ */
 
+function mustEnv(name) {
+  const value = process.env[name];
+
+  if (!value) {
+    throw new Error(`Missing env: ${name}`);
+  }
+
+  return value;
+}
+
+const CONFIG = {
+  apiId: Number(mustEnv("A_ID")),
+  apiHash: mustEnv("A_HASH"),
+  session: mustEnv("A_SS"),
+  botToken: mustEnv("BOT_TOKEN"),
+
+  httpPort: Number(process.env.HTTP_PORT || 3001),
+  tcpPort: Number(process.env.TCP_PORT || 3002),
+  tcpHost: process.env.TCP_HOST || "0.0.0.0",
+
+  socketToken: process.env.SOCKET_TOKEN || "CHANGE_ME_STRONG_TOKEN",
+};
+
+/* ============================================================
+   TELEGRAM CONFIG
+============================================================ */
+
+// Chỉ tài khoản Telegram của bạn được phép gửi lệnh trade
 const ALLOWED_USER_ID = 5978153872;
-const HTTP_PORT = Number(process.env.HTTP_PORT || 3001);
-const TCP_PORT = Number(process.env.TCP_PORT || 3002);
-const TCP_HOST = process.env.TCP_HOST || "0.0.0.0";
-const SOCKET_TOKEN = process.env.SOCKET_TOKEN || "CHANGE_ME_STRONG_TOKEN";
+
+// Channel nhận tín hiệu M5/M15
+const CHANNEL_A = -1003256916567;
+
+// Nếu M15 cùng hướng M5 thì forward sang đây
+const CHANNEL_B = -1003479291587;
+
+// Số message nhìn ngược lại khi M15 xuất hiện
+const PREVIOUS_MESSAGE_LOOKBACK = 2;
+
+/* ============================================================
+   CLIENTS / SERVERS
+============================================================ */
+
+const bot = new Telegraf(CONFIG.botToken);
+
+const userClient = new TelegramClient(
+  new StringSession(CONFIG.session),
+  CONFIG.apiId,
+  CONFIG.apiHash,
+  {
+    connectionRetries: 5,
+  }
+);
+
+const app = express();
 
 const clients = new Set();
 
-/* ================= PARSE TELEGRAM SIGNAL ================= */
+let httpServer = null;
+let shuttingDown = false;
 
-function parseSignal(text) {
-  const symbolMatch = text.match(/^(xauusd[a-z]?|[a-z]{6})/i);
-  const symbol = (symbolMatch ? symbolMatch[1] : "XAUUSD").toUpperCase();
+/* ============================================================
+   TELEGRAM ERROR HANDLER
+============================================================ */
+
+bot.catch((err, ctx) => {
+  console.error(
+    "Telegraf error:",
+    err?.message || err,
+    "| update:",
+    ctx?.update?.update_id
+  );
+});
+
+/* ============================================================
+   FILTER SIGNAL
+   CHANNEL_A: M5 -> M15
+============================================================ */
+
+function parseFilterSignal(text = "") {
+  const tf =
+    text.match(/\b(5m|15m)\b/i)?.[1]?.toLowerCase() ?? null;
+
+  const side =
+    text.match(/\b(BUY|SELL)\b/i)?.[1]?.toUpperCase() ?? null;
+
+  return {
+    tf,
+    side,
+  };
+}
+
+function isFromChannel(msg, channelId) {
+  return msg?.chat?.id === channelId;
+}
+
+function getTelegramText(msg) {
+  if (typeof msg?.text === "string") {
+    return msg.text;
+  }
+
+  if (typeof msg?.caption === "string") {
+    return msg.caption;
+  }
+
+  return "";
+}
+
+async function getPrevious5mSignal(
+  channelId,
+  currentMessageId,
+  lookback = PREVIOUS_MESSAGE_LOOKBACK
+) {
+  const list = await userClient.getMessages(channelId, {
+    limit: lookback,
+    offsetId: currentMessageId,
+  });
+
+  for (const message of list || []) {
+    const text =
+      typeof message?.message === "string"
+        ? message.message
+        : "";
+
+    if (!text) {
+      continue;
+    }
+
+    const parsed = parseFilterSignal(text);
+
+    if (parsed.tf === "5m" && parsed.side) {
+      return {
+        tf: parsed.tf,
+        side: parsed.side,
+        text,
+        messageId: message.id,
+        date: message.date,
+      };
+    }
+  }
+
+  return null;
+}
+
+/* ============================================================
+   CHANNEL POST HANDLER
+============================================================ */
+
+bot.on("channel_post", async (ctx) => {
+  const msg = ctx.channelPost;
+
+  if (!msg) {
+    return;
+  }
+
+  // Chỉ xử lý CHANNEL_A
+  if (!isFromChannel(msg, CHANNEL_A)) {
+    return;
+  }
+
+  const text = getTelegramText(msg);
+
+  if (!text) {
+    return;
+  }
+
+  const current = parseFilterSignal(text);
+
+  // Chỉ quan tâm M15 BUY/SELL
+  if (current.tf !== "15m" || !current.side) {
+    return;
+  }
+
+  try {
+    const previous5m = await getPrevious5mSignal(
+      CHANNEL_A,
+      msg.message_id,
+      PREVIOUS_MESSAGE_LOOKBACK
+    );
+
+    if (!previous5m) {
+      console.log(
+        `[FILTER] M15 ${current.side} ignored: previous M5 not found`
+      );
+
+      return;
+    }
+
+    if (previous5m.side !== current.side) {
+      console.log(
+        `[FILTER] M15 ${current.side} ignored: previous M5=${previous5m.side}`
+      );
+
+      return;
+    }
+
+    await ctx.telegram.forwardMessage(
+      CHANNEL_B,
+      CHANNEL_A,
+      msg.message_id
+    );
+
+    console.log(
+      `🔥 Forwarded M15 ${current.side}` +
+      ` | msgId=${msg.message_id}` +
+      ` | matched M5 msgId=${previous5m.messageId}`
+    );
+  } catch (err) {
+    console.error(
+      "[FILTER] Handler error:",
+      err?.message || err
+    );
+  }
+});
+
+/* ============================================================
+   PARSE TRADE SIGNAL
+============================================================ */
+
+function parseOrderSignal(text) {
+  const symbolMatch = text.match(
+    /^(xauusd[a-z]?|[a-z]{6})/i
+  );
+
+  const symbol = (
+    symbolMatch
+      ? symbolMatch[1]
+      : "XAUUSD"
+  ).toUpperCase();
 
   const upperText = text.toUpperCase();
+
   const type = upperText.includes("BUY")
     ? "BUY_LIMIT"
     : upperText.includes("SELL")
     ? "SELL_LIMIT"
     : null;
 
-  if (!type) return null;
+  if (!type) {
+    return null;
+  }
 
-  const entryMatch = text.match(/🕛:\s*([\d.\s-]+)/);
-  if (!entryMatch) return null;
+  /* ---------------- ENTRY ---------------- */
+
+  const entryMatch = text.match(
+    /🕛:\s*([\d.\s-]+)/
+  );
+
+  if (!entryMatch) {
+    return null;
+  }
 
   const entries = entryMatch[1]
     .split("-")
-    .map((v) => parseFloat(v.trim()))
-    .filter((v) => !Number.isNaN(v));
+    .map((value) => parseFloat(value.trim()))
+    .filter((value) => !Number.isNaN(value));
 
-  if (!entries.length) return null;
+  if (!entries.length) {
+    return null;
+  }
 
-  const slMatch = text.match(/🛑:\s*([\d.]+)/);
-  if (!slMatch) return null;
+  /* ---------------- SL ---------------- */
+
+  const slMatch = text.match(
+    /🛑:\s*([\d.]+)/
+  );
+
+  if (!slMatch) {
+    return null;
+  }
 
   const sl = parseFloat(slMatch[1]);
-  if (Number.isNaN(sl)) return null;
 
-  const tpMatch = text.match(/🎯:\s*([\d.\s-]+)/);
-  if (!tpMatch) return null;
+  if (Number.isNaN(sl)) {
+    return null;
+  }
+
+  /* ---------------- TP ---------------- */
+
+  const tpMatch = text.match(
+    /🎯:\s*([\d.\s-]+)/
+  );
+
+  if (!tpMatch) {
+    return null;
+  }
 
   const tps = tpMatch[1]
     .split("-")
-    .map((v) => parseFloat(v.trim()))
-    .filter((v) => !Number.isNaN(v));
+    .map((value) => parseFloat(value.trim()))
+    .filter((value) => !Number.isNaN(value));
 
-  const lotMatch = text.match(/@[\d.]+,\s*([\d.,\s]+)/);
-  if (!lotMatch) return null;
+  /* ---------------- RISK / LOT ---------------- */
+
+  const lotMatch = text.match(
+    /@[\d.]+,\s*([\d.,\s]+)/
+  );
+
+  if (!lotMatch) {
+    return null;
+  }
 
   const nums = lotMatch[1]
     .split(",")
-    .map((v) => parseFloat(v.trim()))
-    .filter((v) => !Number.isNaN(v));
+    .map((value) => parseFloat(value.trim()))
+    .filter((value) => !Number.isNaN(value));
 
   const n = entries.length;
-  if (nums.length < 1) return null;
+
+  if (nums.length < 1) {
+    return null;
+  }
 
   const totalRisk = nums[0];
+
   const lotsCandidate = nums.slice(1);
+
   let lots = [];
 
   if (lotsCandidate.length >= n) {
-    lots = lotsCandidate.slice(0, n).map((x) => Number(x.toFixed(3)));
+    lots = lotsCandidate
+      .slice(0, n)
+      .map((value) =>
+        Number(value.toFixed(3))
+      );
   } else {
     let risks = [];
 
     if (n === 1) {
-      risks = [totalRisk];
+      risks = [
+        totalRisk,
+      ];
     } else if (n === 2) {
-      risks = [totalRisk / 2, totalRisk / 2];
+      risks = [
+        totalRisk / 2,
+        totalRisk / 2,
+      ];
     } else {
-      const riskFirstTwo = totalRisk * 0.8;
-      const riskEachFirst = riskFirstTwo / 2;
-      const riskLast = totalRisk * 0.2;
+      const riskFirstTwo =
+        totalRisk * 0.8;
 
-      risks = entries.map((_, i) => {
-        if (i === 0 || i === 1) return riskEachFirst;
-        if (i === n - 1) return riskLast;
-        return 0;
-      });
+      const riskEachFirst =
+        riskFirstTwo / 2;
+
+      const riskLast =
+        totalRisk * 0.2;
+
+      risks = entries.map(
+        (_, index) => {
+          if (
+            index === 0 ||
+            index === 1
+          ) {
+            return riskEachFirst;
+          }
+
+          if (index === n - 1) {
+            return riskLast;
+          }
+
+          return 0;
+        }
+      );
     }
 
-    lots = entries.map((entry, i) => {
-      const distance = type === "SELL_LIMIT" ? sl - entry : entry - sl;
-      if (distance <= 0) return 0;
+    lots = entries.map(
+      (entry, index) => {
+        const distance =
+          type === "SELL_LIMIT"
+            ? sl - entry
+            : entry - sl;
 
-      const lot = risks[i] / (distance * 100);
-      return Math.max(0, Number(lot.toFixed(3)));
-    });
+        if (distance <= 0) {
+          return 0;
+        }
+
+        const lot =
+          risks[index] /
+          (distance * 100);
+
+        return Math.max(
+          0,
+          Number(lot.toFixed(3))
+        );
+      }
+    );
   }
 
   lots = Array.from(
-    { length: n },
-    (_, i) => (typeof lots[i] === "number" ? lots[i] : 0)
+    {
+      length: n,
+    },
+    (_, index) =>
+      typeof lots[index] === "number"
+        ? lots[index]
+        : 0
   );
 
-  let orders = entries.map((entry, i) => ({
-    entry,
-    tp: typeof tps[i] === "number" ? tps[i] : null,
-    lot: lots[i],
-  }));
+  let orders = entries.map(
+    (entry, index) => ({
+      entry,
 
-  if (orders.length >= 2 && orders[0].entry === orders[1].entry) {
+      tp:
+        typeof tps[index] === "number"
+          ? tps[index]
+          : null,
+
+      lot: lots[index],
+    })
+  );
+
+  /* ---------------- MERGE SAME ENTRY ---------------- */
+
+  if (
+    orders.length >= 2 &&
+    orders[0].entry === orders[1].entry
+  ) {
     const mergedOrder = {
       entry: orders[0].entry,
-      lot: Number((orders[0].lot + orders[1].lot).toFixed(3)),
-      tp: orders[1].tp ?? orders[0].tp,
+
+      lot: Number(
+        (
+          orders[0].lot +
+          orders[1].lot
+        ).toFixed(3)
+      ),
+
+      tp:
+        orders[1].tp ??
+        orders[0].tp,
     };
 
-    orders = [mergedOrder, ...orders.slice(2)];
+    orders = [
+      mergedOrder,
+      ...orders.slice(2),
+    ];
   }
 
   return {
@@ -128,410 +457,1009 @@ function parseSignal(text) {
   };
 }
 
-/* ================= TCP PUSH SERVER ================= */
+/* ============================================================
+   TCP SERVER
+============================================================ */
 
 function sendLine(socket, payload) {
-  if (!socket || socket.destroyed || !socket.writable) return false;
+  if (
+    !socket ||
+    socket.destroyed ||
+    !socket.writable
+  ) {
+    return false;
+  }
 
-  const line = typeof payload === "string"
-    ? payload
-    : JSON.stringify(payload);
+  const line =
+    typeof payload === "string"
+      ? payload
+      : JSON.stringify(payload);
 
-  return socket.write(`${line}\n`);
+  return socket.write(
+    `${line}\n`
+  );
 }
 
 function broadcastSignal(signal) {
   let delivered = 0;
 
   for (const client of clients) {
-    if (!client.authenticated) continue;
+    if (!client.authenticated) {
+      continue;
+    }
 
-    if (sendLine(client.socket, signal)) {
+    if (
+      sendLine(
+        client.socket,
+        signal
+      )
+    ) {
       delivered += 1;
     }
   }
 
-  // console.log(
-  //   `[TCP] Broadcast ${signal.type} to ${delivered}/${clients.size} connected EA(s)`
-  // );
-
   return delivered;
 }
 
-const tcpServer = net.createServer((socket) => {
-  socket.setEncoding("utf8");
-  socket.setKeepAlive(true, 15_000);
-  socket.setNoDelay(true);
+const tcpServer = net.createServer(
+  (socket) => {
+    socket.setEncoding("utf8");
 
-  const client = {
-    socket,
-    authenticated: false,
-    buffer: "",
-    login: null,
-    server: null,
-    connectedAt: Date.now(),
-    lastSeenAt: Date.now(),
-  };
+    socket.setKeepAlive(
+      true,
+      15_000
+    );
 
-  clients.add(client);
+    socket.setNoDelay(true);
 
-  // console.log(
-  //   `[TCP] Connected: ${socket.remoteAddress}:${socket.remotePort}`
-  // );
+    const client = {
+      socket,
 
-  const authTimeout = setTimeout(() => {
-    if (!client.authenticated) {
-      sendLine(socket, "AUTH_FAILED");
-      socket.destroy();
-    }
-  }, 5_000);
+      authenticated: false,
 
-  socket.on("data", (chunk) => {
-    client.lastSeenAt = Date.now();
-    client.buffer += chunk;
+      buffer: "",
 
-    if (client.buffer.length > 1024 * 1024) {
-      socket.destroy(new Error("Receive buffer overflow"));
-      return;
-    }
+      login: null,
 
-    while (true) {
-      const newlineIndex = client.buffer.indexOf("\n");
-      if (newlineIndex < 0) break;
+      server: null,
 
-      const line = client.buffer.slice(0, newlineIndex).trim();
-      client.buffer = client.buffer.slice(newlineIndex + 1);
+      connectedAt: Date.now(),
 
-      if (!line) continue;
+      lastSeenAt: Date.now(),
+    };
 
-      if (line === "PING") {
-        sendLine(socket, "PONG");
-        continue;
-      }
+    clients.add(client);
 
-      if (line === "PONG") {
-        continue;
-      }
+    /* ---------------- AUTH TIMEOUT ---------------- */
 
-      if (!client.authenticated) {
-        try {
-          const hello = JSON.parse(line);
+    const authTimeout =
+      setTimeout(() => {
+        if (
+          !client.authenticated
+        ) {
+          sendLine(
+            socket,
+            "AUTH_FAILED"
+          );
 
-          if (
-            hello.type !== "HELLO" ||
-            hello.token !== SOCKET_TOKEN
-          ) {
-            sendLine(socket, "AUTH_FAILED");
-            socket.destroy();
-            return;
-          }
-
-          client.authenticated = true;
-          client.login = hello.login ?? null;
-          client.server = hello.server ?? null;
-          clearTimeout(authTimeout);
-
-          sendLine(socket, "AUTH_OK");
-
-          // console.log(
-          //   `[TCP] Authenticated: login=${client.login}, server=${client.server}`
-          // );
-        } catch {
-          sendLine(socket, "AUTH_FAILED");
           socket.destroy();
         }
+      }, 5_000);
 
-        continue;
+    /* ---------------- RECEIVE DATA ---------------- */
+
+    socket.on(
+      "data",
+      (chunk) => {
+        client.lastSeenAt =
+          Date.now();
+
+        client.buffer += chunk;
+
+        // Chống buffer tăng vô hạn
+        if (
+          client.buffer.length >
+          1024 * 1024
+        ) {
+          socket.destroy(
+            new Error(
+              "Receive buffer overflow"
+            )
+          );
+
+          return;
+        }
+
+        while (true) {
+          const newlineIndex =
+            client.buffer.indexOf(
+              "\n"
+            );
+
+          if (
+            newlineIndex < 0
+          ) {
+            break;
+          }
+
+          const line =
+            client.buffer
+              .slice(
+                0,
+                newlineIndex
+              )
+              .trim();
+
+          client.buffer =
+            client.buffer.slice(
+              newlineIndex + 1
+            );
+
+          if (!line) {
+            continue;
+          }
+
+          /* ---------------- PING ---------------- */
+
+          if (line === "PING") {
+            sendLine(
+              socket,
+              "PONG"
+            );
+
+            continue;
+          }
+
+          if (line === "PONG") {
+            continue;
+          }
+
+          /* ---------------- AUTH ---------------- */
+
+          if (
+            !client.authenticated
+          ) {
+            try {
+              const hello =
+                JSON.parse(line);
+
+              if (
+                hello.type !==
+                  "HELLO" ||
+                hello.token !==
+                  CONFIG.socketToken
+              ) {
+                sendLine(
+                  socket,
+                  "AUTH_FAILED"
+                );
+
+                socket.destroy();
+
+                return;
+              }
+
+              client.authenticated =
+                true;
+
+              client.login =
+                hello.login ?? null;
+
+              client.server =
+                hello.server ?? null;
+
+              clearTimeout(
+                authTimeout
+              );
+
+              sendLine(
+                socket,
+                "AUTH_OK"
+              );
+            } catch {
+              sendLine(
+                socket,
+                "AUTH_FAILED"
+              );
+
+              socket.destroy();
+
+              return;
+            }
+
+            continue;
+          }
+        }
       }
-    }
-  });
+    );
 
-  socket.on("error", (error) => {
-    console.error(`[TCP] Client error: ${error.message}`);
-  });
+    /* ---------------- SOCKET ERROR ---------------- */
 
-  socket.on("close", () => {
-    clearTimeout(authTimeout);
-    clients.delete(client);
+    socket.on(
+      "error",
+      (error) => {
+        console.error(
+          `[TCP] Client error: ${error.message}`
+        );
+      }
+    );
 
-    // console.log(
-    //   `[TCP] Disconnected: login=${client.login ?? "unknown"}`
-    // );
-  });
-});
+    /* ---------------- SOCKET CLOSE ---------------- */
 
-tcpServer.on("error", (error) => {
-  console.error(`[TCP] Server error: ${error.message}`);
-  process.exitCode = 1;
-});
+    socket.on(
+      "close",
+      () => {
+        clearTimeout(
+          authTimeout
+        );
 
-tcpServer.listen(TCP_PORT, TCP_HOST, () => {
-  console.log(`TCP signal server running at ${TCP_HOST}:${TCP_PORT}`);
-});
+        clients.delete(
+          client
+        );
+      }
+    );
+  }
+);
 
-/* ================= TELEGRAM BOT ================= */
+tcpServer.on(
+  "error",
+  (error) => {
+    console.error(
+      `[TCP] Server error: ${error.message}`
+    );
+  }
+);
 
-function getRTargets(signal, order, maxR = 5) {
-  const riskDistance = Math.abs(signal.sl - order.entry);
+/* ============================================================
+   R TARGETS
+============================================================ */
 
-  if (!Number.isFinite(riskDistance) || riskDistance <= 0) {
+function getRTargets(
+  signal,
+  order,
+  maxR = 5
+) {
+  const riskDistance =
+    Math.abs(
+      signal.sl -
+      order.entry
+    );
+
+  if (
+    !Number.isFinite(
+      riskDistance
+    ) ||
+    riskDistance <= 0
+  ) {
     return [];
   }
 
-  return Array.from({ length: maxR }, (_, i) => {
-    const r = i + 1;
+  return Array.from(
+    {
+      length: maxR,
+    },
+    (_, index) => {
+      const r =
+        index + 1;
 
-    const price =
-      signal.type === "SELL_LIMIT"
-        ? order.entry - riskDistance * r
-        : order.entry + riskDistance * r;
+      const price =
+        signal.type ===
+        "SELL_LIMIT"
+          ? order.entry -
+            riskDistance * r
+          : order.entry +
+            riskDistance * r;
 
-    return {
-      r,
-      price: price.toFixed(3),
-    };
-  });
+      return {
+        r,
+
+        price:
+          price.toFixed(3),
+      };
+    }
+  );
 }
 
-function c(value) {
-  return `<code>${value}</code>`;
+function formatSignal(
+  signal,
+  delivered
+) {
+  return (
+    `📡 ${signal.symbol}` +
+    `  |  🖥 EA nhận: ${delivered}`
+  );
 }
 
-function formatSignal(signal, delivered) {
-  let text = `📡 ${signal.symbol}  |  🖥 EA nhận: ${delivered}`;
-  return text.trim();
-}
+/* ============================================================
+   PRIVATE MESSAGE / TRADE COMMANDS
+============================================================ */
 
 bot.on("text", async (ctx) => {
+  /*
+   * Quan trọng khi dùng chung bot:
+   *
+   * Không cho channel/group lọt vào
+   * handler đặt lệnh.
+   */
+
   if (
-    ctx.from.id !== ALLOWED_USER_ID ||
-    ctx.chat.id !== ALLOWED_USER_ID
+    !ctx.from ||
+    !ctx.chat
   ) {
     return;
   }
 
-  const originalText = ctx.message.text.trim();
-  const normalizedText = originalText.toLowerCase();
-
-  if (normalizedText === "clear") {
-    await ctx.react("👍");
+  if (
+    ctx.chat.type !== "private"
+  ) {
     return;
   }
 
   if (
-    normalizedText === "be" ||
-    normalizedText === "/be" ||
-    normalizedText === "set be" ||
-    normalizedText === "set_be"
+    ctx.from.id !==
+      ALLOWED_USER_ID ||
+    ctx.chat.id !==
+      ALLOWED_USER_ID
   ) {
-    const signal = {
-      symbol: "XAUUSD",
-      type: "SET_BE",
-      createdAt: Date.now(),
-    };
-
-    const delivered = broadcastSignal(signal);
-
-    if (delivered > 0) {
-      await ctx.react("👍");
-    } else {
-      await ctx.reply("Không có EA nào đang kết nối TCP.");
-    }
-
     return;
   }
 
-  const slMatch = normalizedText.match(
-    /^\/?sl\s+(\d+(?:[.,]\d+)?)$/i
-  );
+  const originalText =
+    ctx.message?.text?.trim();
 
-  if (slMatch) {
-    const price = Number(slMatch[1].replace(",", "."));
+  if (!originalText) {
+    return;
+  }
 
-    if (!Number.isFinite(price) || price <= 0) {
-      await ctx.reply("Giá SL không hợp lệ.");
+  const normalizedText =
+    originalText.toLowerCase();
+
+  try {
+    /* ========================================================
+       CLEAR
+    ======================================================== */
+
+    if (
+      normalizedText ===
+      "clear"
+    ) {
+      await ctx.react("👍");
+
       return;
     }
 
-    const signal = {
-      symbol: "XAUUSD",
-      type: "SET_SL",
-      price,
-      createdAt: Date.now(),
-    };
+    /* ========================================================
+       BREAK EVEN
+    ======================================================== */
 
-    const delivered = broadcastSignal(signal);
+    if (
+      normalizedText ===
+        "be" ||
+      normalizedText ===
+        "/be" ||
+      normalizedText ===
+        "set be" ||
+      normalizedText ===
+        "set_be"
+    ) {
+      const signal = {
+        symbol: "XAUUSD",
 
-    if (delivered > 0) {
-      await ctx.react("👍");
-    } else {
-      await ctx.reply("Không có EA nào đang kết nối TCP.");
-    }
+        type: "SET_BE",
 
-    return;
-  }
+        createdAt:
+          Date.now(),
+      };
 
-  const tpMatch = normalizedText.match(
-    /^\/?tp\s+(\d+(?:[.,]\d+)?)$/i
-  );
+      const delivered =
+        broadcastSignal(
+          signal
+        );
 
-  if (tpMatch) {
-    const price = Number(tpMatch[1].replace(",", "."));
+      if (
+        delivered > 0
+      ) {
+        await ctx.react(
+          "👍"
+        );
+      } else {
+        await ctx.reply(
+          "Không có EA nào đang kết nối TCP."
+        );
+      }
 
-    if (!Number.isFinite(price) || price <= 0) {
-      await ctx.reply("Giá TP không hợp lệ.");
       return;
     }
 
-    const signal = {
-      symbol: "XAUUSD",
-      type: "SET_TP",
-      price,
-      createdAt: Date.now(),
-    };
+    /* ========================================================
+       SET SL
+    ======================================================== */
 
-    const delivered = broadcastSignal(signal);
+    const slMatch =
+      normalizedText.match(
+        /^\/?sl\s+(\d+(?:[.,]\d+)?)$/i
+      );
 
-    if (delivered > 0) {
-      await ctx.react("👍");
-    } else {
-      await ctx.reply("Không có EA nào đang kết nối TCP.");
+    if (slMatch) {
+      const price =
+        Number(
+          slMatch[1].replace(
+            ",",
+            "."
+          )
+        );
+
+      if (
+        !Number.isFinite(
+          price
+        ) ||
+        price <= 0
+      ) {
+        await ctx.reply(
+          "Giá SL không hợp lệ."
+        );
+
+        return;
+      }
+
+      const signal = {
+        symbol:
+          "XAUUSD",
+
+        type:
+          "SET_SL",
+
+        price,
+
+        createdAt:
+          Date.now(),
+      };
+
+      const delivered =
+        broadcastSignal(
+          signal
+        );
+
+      if (
+        delivered > 0
+      ) {
+        await ctx.react(
+          "👍"
+        );
+      } else {
+        await ctx.reply(
+          "Không có EA nào đang kết nối TCP."
+        );
+      }
+
+      return;
     }
 
-    return;
+    /* ========================================================
+       SET TP
+    ======================================================== */
+
+    const tpMatch =
+      normalizedText.match(
+        /^\/?tp\s+(\d+(?:[.,]\d+)?)$/i
+      );
+
+    if (tpMatch) {
+      const price =
+        Number(
+          tpMatch[1].replace(
+            ",",
+            "."
+          )
+        );
+
+      if (
+        !Number.isFinite(
+          price
+        ) ||
+        price <= 0
+      ) {
+        await ctx.reply(
+          "Giá TP không hợp lệ."
+        );
+
+        return;
+      }
+
+      const signal = {
+        symbol:
+          "XAUUSD",
+
+        type:
+          "SET_TP",
+
+        price,
+
+        createdAt:
+          Date.now(),
+      };
+
+      const delivered =
+        broadcastSignal(
+          signal
+        );
+
+      if (
+        delivered > 0
+      ) {
+        await ctx.react(
+          "👍"
+        );
+      } else {
+        await ctx.reply(
+          "Không có EA nào đang kết nối TCP."
+        );
+      }
+
+      return;
+    }
+
+    /* ========================================================
+       NEW ORDER
+    ======================================================== */
+
+    const signal =
+      parseOrderSignal(
+        originalText
+      );
+
+    if (!signal) {
+      return;
+    }
+
+    const delivered =
+      broadcastSignal(
+        signal
+      );
+
+    /* ---------------- INLINE KEYBOARD ---------------- */
+
+    const keyboard = [];
+
+    signal.orders.forEach(
+      (order, index) => {
+        const rTargets =
+          getRTargets(
+            signal,
+            order,
+            5
+          );
+
+        const tpPrefix =
+          "TP ";
+
+        keyboard.push([
+          {
+            text:
+              `📥 E${index + 1} ${order.entry}`,
+
+            copy_text: {
+              text:
+                String(
+                  order.entry
+                ),
+            },
+          },
+
+          {
+            text:
+              `🎯 TP ${
+                order.tp ??
+                "N/A"
+              }`,
+
+            copy_text: {
+              text:
+                tpPrefix +
+                String(
+                  order.tp ??
+                  ""
+                ),
+            },
+          },
+        ]);
+
+        /*
+         * Nếu SL == Entry thì
+         * riskDistance = 0.
+         *
+         * Tránh crash vì
+         * rTargets[0] undefined.
+         */
+
+        if (
+          rTargets.length >= 5
+        ) {
+          keyboard.push([
+            {
+              text:
+                `1R ${rTargets[0].price}`,
+
+              copy_text: {
+                text:
+                  tpPrefix +
+                  rTargets[0]
+                    .price,
+              },
+            },
+
+            {
+              text:
+                `2R ${rTargets[1].price}`,
+
+              copy_text: {
+                text:
+                  tpPrefix +
+                  rTargets[1]
+                    .price,
+              },
+            },
+          ]);
+
+          keyboard.push([
+            {
+              text:
+                `3R ${rTargets[2].price}`,
+
+              copy_text: {
+                text:
+                  tpPrefix +
+                  rTargets[2]
+                    .price,
+              },
+            },
+
+            {
+              text:
+                `5R ${rTargets[4].price}`,
+
+              copy_text: {
+                text:
+                  tpPrefix +
+                  rTargets[4]
+                    .price,
+              },
+            },
+          ]);
+        }
+      }
+    );
+
+    keyboard.push([
+      {
+        text:
+          `🛑 SL ${signal.sl}`,
+
+        copy_text: {
+          text:
+            "SL " +
+            String(
+              signal.sl
+            ),
+        },
+      },
+    ]);
+
+    await ctx.reply(
+      formatSignal(
+        signal,
+        delivered
+      ),
+      {
+        reply_to_message_id:
+          ctx.message
+            .message_id,
+
+        parse_mode:
+          "HTML",
+
+        reply_markup: {
+          inline_keyboard:
+            keyboard,
+        },
+      }
+    );
+  } catch (error) {
+    console.error(
+      "[TRADE] Handler error:",
+      error?.message || error
+    );
   }
-
-  const signal = parseSignal(originalText);
-  if (!signal) return;
-
-  const delivered = broadcastSignal(signal);
-
-  const keyboard = [];
-
-  signal.orders.forEach((order, index) => {
-    const rTargets = getRTargets(signal, order, 5);
-    const tpx = `TP `;
-
-    keyboard.push([
-      {
-        text: `📥 E${index + 1} ${order.entry}`,
-        copy_text: { text: String(order.entry), },
-      },
-      {
-        text: `🎯 TP ${order.tp ?? "N/A"}`,
-        copy_text: { text: tpx + String(order.tp ?? ""), },
-      },
-    ]);
-
-    keyboard.push([
-      {
-        text: `1R ${rTargets[0].price}`,
-        copy_text: { text: tpx + rTargets[0].price, },
-      },
-      {
-        text: `2R ${rTargets[1].price}`,
-        copy_text: { text: tpx + rTargets[1].price, },
-      },
-    ]);
-
-    keyboard.push([
-      {
-        text: `3R ${rTargets[2].price}`,
-        copy_text: { text: tpx + rTargets[2].price, },
-      },
-      {
-        text: `5R ${rTargets[4].price}`,
-        copy_text: { text: tpx + rTargets[4].price, },
-      },
-    ]);
-  });
-
-  keyboard.push([
-    {
-      text: `🛑 SL ${signal.sl}`,
-      copy_text: {
-        text: `SL ` + String(signal.sl),
-      },
-    },
-  ]);
-
-  await ctx.reply(formatSignal(signal, delivered), {
-    reply_to_message_id: ctx.message.message_id,
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: keyboard,
-    },
-  });
 });
 
-/* ================= STATUS API ================= */
+/* ============================================================
+   HTTP STATUS API
+============================================================ */
 
-app.get("/ping", (_req, res) => {
-  res.send("pong");
-});
+app.get(
+  "/ping",
+  (_req, res) => {
+    res.send("pong");
+  }
+);
 
-app.get("/status", (_req, res) => {
-  const connectedClients = [...clients].map((client) => ({
-    authenticated: client.authenticated,
-    // login: client.login,
-    server: client.server,
-    remoteAddress: client.socket.remoteAddress,
-    connectedAt: client.connectedAt,
-    lastSeenAt: client.lastSeenAt,
-  }));
+app.get(
+  "/status",
+  (_req, res) => {
+    const connectedClients =
+      [...clients].map(
+        (client) => ({
+          authenticated:
+            client.authenticated,
 
-  res.json({
-    ok: true,
-    connectedEA: connectedClients.filter((client) => client.authenticated).length,
-    clients: connectedClients,
-  });
-});
+          server:
+            client.server,
 
-app.listen(HTTP_PORT, "0.0.0.0", () => {
-  console.log(`Status API running at http://0.0.0.0:${HTTP_PORT}`);
-});
+          remoteAddress:
+            client.socket
+              .remoteAddress,
 
-/* ================= HEARTBEAT / CLEANUP ================= */
+          connectedAt:
+            client.connectedAt,
+
+          lastSeenAt:
+            client.lastSeenAt,
+        })
+      );
+
+    res.json({
+      ok: true,
+
+      connectedEA:
+        connectedClients.filter(
+          (client) =>
+            client.authenticated
+        ).length,
+
+      clients:
+        connectedClients,
+    });
+  }
+);
+
+/* ============================================================
+   TCP HEARTBEAT
+============================================================ */
 
 setInterval(() => {
   const now = Date.now();
 
-  for (const client of clients) {
-    if (client.socket.destroyed) continue;
-
-    if (now - client.lastSeenAt > 90_000) {
-      client.socket.destroy();
+  for (
+    const client
+    of clients
+  ) {
+    if (
+      client.socket.destroyed
+    ) {
       continue;
     }
 
-    if (client.authenticated) {
-      sendLine(client.socket, "PING");
+    /*
+     * Không phản hồi > 90s
+     * => loại connection.
+     */
+
+    if (
+      now -
+        client.lastSeenAt >
+      90_000
+    ) {
+      client.socket.destroy();
+
+      continue;
+    }
+
+    if (
+      client.authenticated
+    ) {
+      sendLine(
+        client.socket,
+        "PING"
+      );
     }
   }
 }, 30_000).unref();
 
-async function shutdown(signal) {
-  console.log(`Received ${signal}, shutting down...`);
+/* ============================================================
+   START
+============================================================ */
 
-  bot.stop(signal);
+async function start() {
+  console.log(
+    "🚀 Starting combined app..."
+  );
 
-  for (const client of clients) {
-    client.socket.destroy();
-  }
+  /* ---------------- GramJS ---------------- */
 
-  tcpServer.close();
+  await userClient.connect();
 
-  process.exit(0);
+  console.log(
+    "👤 Telegram user client connected"
+  );
+
+  /* ---------------- TCP ---------------- */
+
+  tcpServer.listen(
+    CONFIG.tcpPort,
+    CONFIG.tcpHost,
+    () => {
+      console.log(
+        `🔌 TCP server running at ${CONFIG.tcpHost}:${CONFIG.tcpPort}`
+      );
+    }
+  );
+
+  /* ---------------- HTTP ---------------- */
+
+  httpServer =
+    app.listen(
+      CONFIG.httpPort,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `🌐 Status API running at http://0.0.0.0:${CONFIG.httpPort}`
+        );
+      }
+    );
+
+  /* ---------------- Telegram Bot ---------------- */
+
+  await bot.launch();
+
+  console.log(
+    "🤖 Telegram bot running"
+  );
+
+  console.log(
+    "✅ Combined app started successfully"
+  );
 }
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+/* ============================================================
+   SHUTDOWN
+============================================================ */
 
-bot.launch()
-  .then(() => {
-    console.log("Telegram bot started");
-  })
-  .catch((error) => {
-    console.error("Telegram bot launch failed:", error);
+async function shutdown(
+  signal
+) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+
+  console.log(
+    `🛑 Shutting down (${signal})...`
+  );
+
+  try {
+    /* ---------------- Telegram Bot ---------------- */
+
+    try {
+      bot.stop(signal);
+    } catch {
+      // Ignore if bot was not started
+    }
+
+    /* ---------------- TCP CLIENTS ---------------- */
+
+    for (
+      const client
+      of clients
+    ) {
+      try {
+        client.socket.destroy();
+      } catch {
+        // ignore
+      }
+    }
+
+    clients.clear();
+
+    /* ---------------- TCP SERVER ---------------- */
+
+    try {
+      tcpServer.close();
+    } catch {
+      // ignore
+    }
+
+    /* ---------------- HTTP SERVER ---------------- */
+
+    try {
+      if (httpServer) {
+        httpServer.close();
+      }
+    } catch {
+      // ignore
+    }
+
+    /* ---------------- GramJS ---------------- */
+
+    try {
+      if (
+        typeof userClient.disconnect ===
+        "function"
+      ) {
+        await userClient.disconnect();
+      }
+    } catch (
+      error
+    ) {
+      console.error(
+        "GramJS disconnect error:",
+        error?.message || error
+      );
+    }
+  } finally {
+    process.exit(0);
+  }
+}
+
+/* ============================================================
+   PROCESS EVENTS
+============================================================ */
+
+process.once(
+  "SIGINT",
+  () =>
+    shutdown(
+      "SIGINT"
+    )
+);
+
+process.once(
+  "SIGTERM",
+  () =>
+    shutdown(
+      "SIGTERM"
+    )
+);
+
+process.on(
+  "unhandledRejection",
+  (reason) => {
+    console.error(
+      "UNHANDLED REJECTION:"
+    );
+
+    console.error(
+      reason
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "UNCAUGHT EXCEPTION:"
+    );
+
+    console.error(
+      error
+    );
+
     process.exit(1);
-  });
+  }
+);
+
+/* ============================================================
+   RUN
+============================================================ */
+
+start().catch(
+  (error) => {
+    console.error(
+      "Startup error:",
+      error?.message || error
+    );
+
+    process.exit(1);
+  }
+);

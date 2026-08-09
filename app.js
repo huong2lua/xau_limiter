@@ -760,14 +760,14 @@ function getRTargets(
   );
 }
 
-function formatSignal(
-  signal,
-  delivered
-) {
-  return (
-    `📡 ${signal.symbol}` +
-    `  |  🖥 EA nhận: ${delivered}`
-  );
+function formatSignal( signal, delivered ) {
+  let text = `📡: ${signal.symbol}`;
+  text += `, 🖥 EA nhận: ${delivered}\n`;
+
+  text += signal.orders
+    .map((order, index) => `lot${index + 1}: ${order.lot}`)
+    .join(', ');
+  return text.trim();
 }
 
 /* ============================================================

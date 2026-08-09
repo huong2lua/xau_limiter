@@ -761,8 +761,8 @@ function getRTargets(
 }
 
 function formatSignal( signal, delivered ) {
-  let text = `📡: ${signal.symbol}`;
-  text += `, 🖥 EA nhận: ${delivered}\n`;
+  let text = `📡 ${signal.symbol}`;
+  text += `, 🖥 EA nhận: ${delivered}, `;
 
   text += signal.orders
     .map((order, index) => `lot${index + 1}: ${order.lot}`)

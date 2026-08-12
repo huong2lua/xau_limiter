@@ -5,6 +5,30 @@ const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const express = require("express");
 const net = require("net");
+const fs = require("fs");
+const path = require("path");
+
+/*
+ * File tải xuống được để đuôi .js1.
+ * Khi chạy thật, module Forex News có thể là:
+ *   - forexNews.js1
+ *   - hoặc forexNews.js
+ */
+const forexNewsModulePath =
+  fs.existsSync(
+    path.join(
+      __dirname,
+      "forexNews.js1"
+    )
+  )
+    ? "./forexNews.js1"
+    : "./forexNews.js";
+
+const {
+  createForexNews,
+} = require(
+  forexNewsModulePath
+);
 
 /* ============================================================
    CONFIG
@@ -83,6 +107,58 @@ bot.catch((err, ctx) => {
     ctx?.update?.update_id
   );
 });
+
+/* ============================================================
+   FOREX FACTORY NEWS
+   Phải khởi tạo trước bot.on("text") để /today, /news, /next
+   không bị handler trade tổng quát nuốt mất.
+============================================================ */
+
+const forexNews =
+  createForexNews(
+    bot,
+    {
+      allowedUserId:
+        ALLOWED_USER_ID,
+
+      // Tin tự động chỉ gửi vào channel/chat được cấu hình ở .env.
+      // Nếu để trống FOREX_NEWS_CHAT_ID thì phần gửi tự động sẽ bỏ qua.
+      chatId:
+        process.env
+          .FOREX_NEWS_CHAT_ID
+          ? Number(
+              process.env
+                .FOREX_NEWS_CHAT_ID
+            )
+          : null,
+
+      timezone:
+        process.env
+          .FOREX_NEWS_TIMEZONE ||
+        "Asia/Ho_Chi_Minh",
+
+      reportHour:
+        Number(
+          process.env
+            .FOREX_NEWS_REPORT_HOUR ||
+            7
+        ),
+
+      reportMinute:
+        Number(
+          process.env
+            .FOREX_NEWS_REPORT_MINUTE ||
+            0
+        ),
+
+      remindBeforeMinutes:
+        Number(
+          process.env
+            .FOREX_NEWS_REMIND_MINUTES ||
+            30
+        ),
+    }
+  );
 
 /* ============================================================
    FILTER SIGNAL
@@ -801,6 +877,11 @@ bot.on("text", async (ctx) => {
     ctx.chat.id !==
       ALLOWED_USER_ID
   ) {
+    // Người khác không có quyền trade, nhưng bot vẫn trả lời hướng dẫn tin tức.
+    await forexNews.sendHelp(
+      ctx.chat.id
+    );
+
     return;
   }
 
@@ -1009,6 +1090,10 @@ bot.on("text", async (ctx) => {
       );
 
     if (!signal) {
+      await forexNews.sendHelp(
+        ctx.chat.id
+      );
+
       return;
     }
 
@@ -1307,6 +1392,14 @@ async function start() {
       }
     );
 
+  /* ---------------- Forex Factory News ---------------- */
+
+  await forexNews.start();
+
+  console.log(
+    "📰 Forex Factory news module running"
+  );
+
   /* ---------------- Telegram Bot ---------------- */
 
   bot.launch().catch((error) => {
@@ -1340,6 +1433,19 @@ async function shutdown(
   );
 
   try {
+    /* ---------------- Forex Factory News ---------------- */
+
+    try {
+      forexNews.stop();
+    } catch (
+      error
+    ) {
+      console.error(
+        "Forex news stop error:",
+        error?.message || error
+      );
+    }
+
     /* ---------------- Telegram Bot ---------------- */
 
     try {

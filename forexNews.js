@@ -1151,29 +1151,6 @@ function createForexNews(
   function isAllowedCommand(
     ctx
   ) {
-    if (
-      !ctx?.from ||
-      !ctx?.chat
-    ) {
-      return false;
-    }
-
-    if (
-      ctx.chat.type !==
-      "private"
-    ) {
-      return false;
-    }
-
-    if (
-      allowedUserId !==
-        null &&
-      ctx.from.id !==
-        allowedUserId
-    ) {
-      return false;
-    }
-
     return true;
   }
 

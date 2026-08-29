@@ -545,6 +545,110 @@ function createForexNews(
     ].join("-");
   }
 
+  function getDayOfWeek(date = new Date()) {
+    const parts = getZonedParts(date);
+
+    // Tính thứ theo ngày ở timezone cấu hình, không phụ thuộc timezone của server.
+    const utcDate = new Date(
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day
+      )
+    );
+
+    return utcDate.getUTCDay();
+    // 0 = CN, 1 = T2, ..., 6 = T7
+  }
+
+  function isWeekend(date = new Date()) {
+    const day = getDayOfWeek(date);
+
+    return day === 0 || day === 6;
+  }
+
+  function getWeekRange(date = new Date()) {
+    const parts = getZonedParts(date);
+
+    const current = new Date(
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day
+      )
+    );
+
+    const day = current.getUTCDay();
+
+    let daysToMonday;
+
+    if (day === 6) {
+      // Thứ 7 -> tuần kế tiếp bắt đầu từ Thứ 2 (+2 ngày)
+      daysToMonday = 2;
+    } else if (day === 0) {
+      // Chủ nhật -> tuần kế tiếp bắt đầu từ Thứ 2 (+1 ngày)
+      daysToMonday = 1;
+    } else {
+      // Thứ 2 -> Thứ 6 -> Thứ 2 của tuần hiện tại
+      daysToMonday = 1 - day;
+    }
+
+    const monday = new Date(current);
+    monday.setUTCDate(
+      current.getUTCDate() + daysToMonday
+    );
+
+    const friday = new Date(monday);
+    friday.setUTCDate(
+      monday.getUTCDate() + 4
+    );
+
+    return {
+      monday,
+      friday,
+    };
+  }
+
+  function formatWeekday(date) {
+    const day = getDayOfWeek(date);
+
+    const names = {
+      1: "THỨ 2",
+      2: "THỨ 3",
+      3: "THỨ 4",
+      4: "THỨ 5",
+      5: "THỨ 6",
+    };
+
+    return names[day] || "";
+  }
+
+  function getWeekEvents(date = new Date()) {
+    const { monday, friday } = getWeekRange(date);
+
+    const mondayKey = getDateKey(monday);
+    const fridayKey = getDateKey(friday);
+
+    return getHighImpactUsdEvents().filter((event) => {
+      const eventDateValue = eventDate(event);
+
+      if (!eventDateValue) {
+        return false;
+      }
+
+      const day = getDayOfWeek(eventDateValue);
+
+      // Chỉ lấy Thứ 2 -> Thứ 6
+      if (day < 1 || day > 5) {
+        return false;
+      }
+
+      const key = getDateKey(eventDateValue);
+
+      return key >= mondayKey && key <= fridayKey;
+    });
+  }
+
   function formatDate(
     date
   ) {
@@ -984,69 +1088,75 @@ function createForexNews(
     return text.trim();
   }
 
-  function buildNextMessage(
-    group
-  ) {
-    const date =
-      new Date(
-        group.timestamp
-      );
-
-    const diffMinutes =
-      Math.max(
-        1,
-        Math.ceil(
-          (
-            group.timestamp -
-            Date.now()
-          ) /
-            60_000
-        )
-      );
+  function buildNextMessage(events) {
+    const now = new Date();
+    const { monday, friday } = getWeekRange(now);
 
     let text = "";
 
     text +=
-      "⏭ <b>USD HIGH IMPACT TIẾP THEO</b>\n\n";
+      "⏭ <b>USD HIGH IMPACT — TIN TRONG TUẦN</b>\n\n";
 
     text +=
-      `📅 ${formatDate(
-        date
-      )}\n`;
+      `📅 <b>${formatDate(monday)}</b> → <b>${formatDate(friday)}</b>\n`;
 
     text +=
-      `⏰ <b>${formatTime(
-        date
-      )}</b> 🇻🇳\n`;
+      `📰 Tổng cộng: <b>${events.length}</b> tin\n`;
 
-    if (
-      diffMinutes < 60
-    ) {
+    if (events.length === 0) {
       text +=
-        `⏳ Còn khoảng <b>${diffMinutes} phút</b>\n`;
-    } else {
-      const hours =
-        diffMinutes / 60;
+        "\n✅ Tuần này không có tin USD High Impact.";
 
-      text +=
-        `⏳ Còn khoảng <b>${hours.toFixed(
-          1
-        )} giờ</b>\n`;
+      text += "\n\nNguồn: Forex Factory";
+
+      return text.trim();
     }
 
-    text += "\n";
+    // Group theo từng ngày, sau đó group tiếp theo giờ.
+    const dayGroups = new Map();
 
-    for (
-      const event
-      of group.events
-    ) {
-      text +=
-        formatEvent(event) +
-        "\n\n";
+    for (const event of events) {
+      const date = eventDate(event);
+
+      if (!date) {
+        continue;
+      }
+
+      const dateKey = getDateKey(date);
+
+      if (!dayGroups.has(dateKey)) {
+        dayGroups.set(dateKey, []);
+      }
+
+      dayGroups.get(dateKey).push(event);
     }
 
-    text +=
-      "Nguồn: Forex Factory";
+    for (const [, dayEvents] of dayGroups) {
+      const date = eventDate(dayEvents[0]);
+
+      text += "\n━━━━━━━━━━━━━━\n";
+
+      text +=
+        `📅 <b>${formatWeekday(date)} — ${formatDate(date)}</b>\n`;
+
+      const groups = groupEventsByTime(dayEvents);
+
+      for (const group of groups) {
+        const groupDate = new Date(group.timestamp);
+
+        text +=
+          `\n⏰ <b>${formatTime(groupDate)}</b> 🇻🇳\n\n`;
+
+        for (const event of group.events) {
+          text +=
+            formatEvent(event) +
+            "\n\n";
+        }
+      }
+    }
+
+    text += "━━━━━━━━━━━━━━\n";
+    text += "Nguồn: Forex Factory";
 
     return text.trim();
   }
@@ -1112,38 +1222,13 @@ function createForexNews(
   ) {
     await refreshCalendar();
 
-    const futureEvents =
-      getFutureEvents();
-
-    if (
-      futureEvents.length === 0
-    ) {
-      return sendHtml(
-        targetChatId,
-        "✅ Hiện không còn tin USD High Impact nào trong dữ liệu tuần này."
-      );
-    }
-
-    const timestamp =
-      eventTimeMs(
-        futureEvents[0]
-      );
-
-    const group = {
-      timestamp,
-      events:
-        futureEvents.filter(
-          (event) =>
-            eventTimeMs(
-              event
-            ) === timestamp
-        ),
-    };
+    const weekEvents =
+      getWeekEvents();
 
     return sendHtml(
       targetChatId,
       buildNextMessage(
-        group
+        weekEvents
       )
     );
   }
@@ -1222,6 +1307,11 @@ function createForexNews(
     const now =
       new Date();
 
+    // Không tự động gửi daily report vào Thứ 7 / Chủ nhật.
+    if (isWeekend(now)) {
+      return;
+    }
+
     const parts =
       getZonedParts(now);
 
@@ -1276,6 +1366,11 @@ function createForexNews(
 
     const now =
       Date.now();
+
+    // Không tự động gửi reminder vào Thứ 7 / Chủ nhật.
+    if (isWeekend(new Date(now))) {
+      return;
+    }
 
     const groups =
       groupEventsByTime(
@@ -1542,6 +1637,7 @@ function createForexNews(
     sendNext,
     getTodayEvents,
     getFutureEvents,
+    getWeekEvents,
     getLastRefreshAt: () =>
       lastRefreshAt,
     getCalendarCacheFile: () =>

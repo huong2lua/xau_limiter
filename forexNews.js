@@ -1020,9 +1020,6 @@ function createForexNews(
       }
     }
 
-    text +=
-      "Nguồn: Forex Factory";
-
     return text.trim();
   }
 
@@ -1082,9 +1079,6 @@ function createForexNews(
     text +=
       "⚠️ <b>High Impact USD</b>\n";
 
-    text +=
-      "Nguồn: Forex Factory";
-
     return text.trim();
   }
 
@@ -1106,8 +1100,6 @@ function createForexNews(
     if (events.length === 0) {
       text +=
         "\n✅ Tuần này không có tin USD High Impact.";
-
-      text += "\n\nNguồn: Forex Factory";
 
       return text.trim();
     }
@@ -1156,7 +1148,6 @@ function createForexNews(
     }
 
     text += "━━━━━━━━━━━━━━\n";
-    text += "Nguồn: Forex Factory";
 
     return text.trim();
   }

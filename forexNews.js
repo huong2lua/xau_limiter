@@ -795,13 +795,13 @@ function createForexNews(
 
       saveCalendarCache();
 
-      console.log(
-        `[NEWS] Calendar refreshed: ${calendarEvents.length} events` +
-          ` | next request after ~${Math.round(
-            minRefreshAgeMs /
-              60_000
-          )}m`
-      );
+      // console.log(
+      //   `[NEWS] Calendar refreshed: ${calendarEvents.length} events` +
+      //     ` | next request after ~${Math.round(
+      //       minRefreshAgeMs /
+      //         60_000
+      //     )}m`
+      // );
 
       return true;
     } catch (error) {
@@ -1340,10 +1340,6 @@ function createForexNews(
         today;
 
       saveState();
-
-      console.log(
-        `[NEWS] Daily report sent: ${today}`
-      );
     }
   }
 

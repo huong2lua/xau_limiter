@@ -287,12 +287,6 @@ bot.on("channel_post", async (ctx) => {
       CHANNEL_A,
       msg.message_id
     );
-
-    console.log(
-      `🔥 Forwarded M15 ${current.side}` +
-      ` | msgId=${msg.message_id}` +
-      ` | matched M5 msgId=${previous5m.messageId}`
-    );
   } catch (err) {
     console.error(
       "[FILTER] Handler error:",
@@ -1402,7 +1396,7 @@ async function start() {
 
   /* ---------------- Telegram Bot ---------------- */
 
-  bot.launch().catch((error) => {
+  bot.launch({dropPendingUpdates: true}).catch((error) => {
     console.error(
       "Telegram bot launch error:",
       error?.message || error

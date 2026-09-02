@@ -1,5 +1,5 @@
 #property strict
-#property version "4.32"
+#property version "4.37"
 
 #include <Trade/Trade.mqh>
 
@@ -7,15 +7,19 @@ CTrade trade;
 
 //================ INPUTS =================//
 
-input string API                = "http://host:3001/pull";
-input int    POLL_SECONDS       = 1;
-input long   MAGIC              = 123456789;
+input string SOCKET_HOST        = "http://locahost";
+input int    SOCKET_PORT        = 3002;
+input string SOCKET_TOKEN       = "socket_token";
+input int    SOCKET_TIMER_MS    = 100;
+input int    RECONNECT_SECONDS  = 3;
+input long   MAGIC              = 2501153001;
 input string COMMENT_TXT        = "";
-input bool   DEBUG_LOG          = true;
+input bool   DEBUG_LOG          = false;
 
-// Thời hạn của pending LIMIT, tính từ lúc EA nhận tín hiệu.
+// Thời hạn của pending LIMIT, tính từ lúc EA nhận tín hiệu, đơn vị PHÚT.
 // Đặt 0 để dùng GTC.
-input int    LIMIT_EXPIRY_HOURS = 4;
+input int    LIMIT_EXPIRY_MINUTES = 240;
+input double BE_OFFSET_PRICE = 0.1;
 
 //================ BROKER SYMBOL CONFIG =================//
 //
@@ -48,7 +52,14 @@ const string DEFAULT_SYMBOL_CANDIDATES = "XAUUSD";
 //================ GLOBALS =================//
 
 long     g_last_login = -1;
-datetime g_last_poll  = 0;
+int      g_socket = INVALID_HANDLE;
+string   g_socket_buffer = "";
+datetime g_last_connect_attempt = 0;
+datetime g_last_heartbeat = 0;
+bool     g_chart_recovering = false;
+datetime g_last_chart_recovery = 0;
+bool     g_pending_chart_recovery = false;
+string   g_trade_symbol = "";
 
 //================ LOG =================//
 
@@ -338,11 +349,15 @@ string ResolveSignalSymbol(string incoming)
 
 string PickSafeChartSymbol()
 {
-   // Ưu tiên đúng symbol vàng theo broker mapping hiện tại
-   string goldSymbol = ResolveSignalSymbol("XAUUSD");
+   // Dùng symbol đã cache; chỉ resolve lại khi khởi động/đổi tài khoản
+   // hoặc khi terminal chưa tải xong symbol của tài khoản mới.
+   if(IsUsableSymbol(g_trade_symbol))
+      return g_trade_symbol;
 
-   if(goldSymbol != "")
-      return goldSymbol;
+   g_trade_symbol = ResolveSignalSymbol("XAUUSD");
+
+   if(g_trade_symbol != "")
+      return g_trade_symbol;
 
    // Fallback: lấy symbol đầu tiên trong Market Watch
    int total = SymbolsTotal(false);
@@ -379,16 +394,56 @@ string PickSafeChartSymbol()
 
 void EnsureChartSymbolAlive()
 {
+   // Ngăn gọi lồng nhau khi ChartSetSymbolPeriod phát sinh CHARTEVENT_CHART_CHANGE.
+   if(g_chart_recovering)
+      return;
+
    string currentSymbol = Symbol();
 
-   if(SymbolExists(currentSymbol))
+   // Bình thường chart còn dùng được thì không đụng vào chart.
+   // Riêng lúc đổi tài khoản, nếu chart chưa phải symbol vàng đã cache thì vẫn chuyển.
+   if(
+      IsUsableSymbol(currentSymbol) &&
+      (
+         !g_pending_chart_recovery ||
+         (IsUsableSymbol(g_trade_symbol) && currentSymbol == g_trade_symbol)
+      )
+   )
+   {
       return;
+   }
+
+   // Hạn chế thử phục hồi liên tục khi terminal chưa tải xong danh sách symbol.
+   datetime now = TimeLocal();
+
+   if(now - g_last_chart_recovery < 2)
+      return;
+
+   g_last_chart_recovery = now;
+   g_chart_recovering = true;
 
    string safeSymbol = PickSafeChartSymbol();
 
    if(safeSymbol == "")
    {
       Log("NO SAFE CHART SYMBOL FOUND");
+      g_chart_recovering = false;
+      return;
+   }
+
+   ResetLastError();
+
+   if(!SymbolSelect(safeSymbol, true))
+   {
+      Log(
+         StringFormat(
+            "CHART SYMBOL SELECT FAILED | symbol=%s | error=%d",
+            safeSymbol,
+            GetLastError()
+         )
+      );
+
+      g_chart_recovering = false;
       return;
    }
 
@@ -400,15 +455,22 @@ void EnsureChartSymbolAlive()
       (ENUM_TIMEFRAMES)Period()
    );
 
+   int errorCode = GetLastError();
+
    Log(
       StringFormat(
          "CHART SYMBOL RECOVERY | old=%s | new=%s | requested=%d | error=%d",
          currentSymbol,
          safeSymbol,
          (int)requested,
-         GetLastError()
+         errorCode
       )
    );
+
+   if(requested)
+      ChartRedraw(0);
+
+   g_chart_recovering = false;
 }
 
 //================ NORMALIZE =================//
@@ -475,75 +537,180 @@ double NormalizeVolume(
    return normalized;
 }
 
-//================ HTTP =================//
+//================ TCP SOCKET =================//
 
-string HttpResultToString(
-   const char &result[]
-)
+void CloseSignalSocket(const string reason = "")
 {
-   int size = ArraySize(result);
+   if(g_socket != INVALID_HANDLE)
+   {
+      SocketClose(g_socket);
+      g_socket = INVALID_HANDLE;
+   }
 
+   g_socket_buffer = "";
+
+   if(reason != "")
+      Log("SOCKET CLOSED | " + reason);
+}
+
+bool SendSocketLine(const string line)
+{
+   if(g_socket == INVALID_HANDLE || !SocketIsConnected(g_socket))
+      return false;
+
+   string payload = line + "\n";
+   uchar data[];
+   int length = StringToCharArray(payload, data, 0, WHOLE_ARRAY, CP_UTF8) - 1;
+
+   if(length <= 0)
+      return false;
+
+   ResetLastError();
+   int sent = SocketSend(g_socket, data, (uint)length);
+
+   if(sent != length)
+   {
+      Log(StringFormat("SOCKET SEND FAILED | sent=%d/%d | error=%d", sent, length, GetLastError()));
+      CloseSignalSocket("send failed");
+      return false;
+   }
+
+   return true;
+}
+
+bool ConnectSignalSocket()
+{
+   if(g_socket != INVALID_HANDLE && SocketIsConnected(g_socket))
+      return true;
+
+   datetime now = TimeLocal();
+
+   if(now - g_last_connect_attempt < RECONNECT_SECONDS)
+      return false;
+
+   g_last_connect_attempt = now;
+   CloseSignalSocket();
+
+   ResetLastError();
+   g_socket = SocketCreate(SOCKET_DEFAULT);
+
+   if(g_socket == INVALID_HANDLE)
+   {
+      Log(StringFormat("SOCKET CREATE FAILED | error=%d", GetLastError()));
+      return false;
+   }
+
+   SocketTimeouts(g_socket, 1000, 1000);
+
+   ResetLastError();
+
+   if(!SocketConnect(g_socket, SOCKET_HOST, (uint)SOCKET_PORT, 2000))
+   {
+      Log(StringFormat("SOCKET CONNECT FAILED | %s:%d | error=%d", SOCKET_HOST, SOCKET_PORT, GetLastError()));
+      CloseSignalSocket();
+      return false;
+   }
+
+   string hello = StringFormat(
+      "{\"type\":\"HELLO\",\"token\":\"%s\",\"login\":%I64d,\"server\":\"%s\"}",
+      SOCKET_TOKEN,
+      (long)AccountInfoInteger(ACCOUNT_LOGIN),
+      AccountInfoString(ACCOUNT_SERVER)
+   );
+
+   if(!SendSocketLine(hello))
+      return false;
+
+   g_last_heartbeat = TimeLocal();
+
+   Log(StringFormat("SOCKET CONNECTED | %s:%d | login=%I64d", SOCKET_HOST, SOCKET_PORT, (long)AccountInfoInteger(ACCOUNT_LOGIN)));
+   return true;
+}
+
+string BytesToUtf8(const uchar &bytes[], const int size)
+{
    if(size <= 0)
       return "";
 
-   uchar bytes[];
-   ArrayResize(bytes, size);
-
-   for(int i = 0; i < size; i++)
-      bytes[i] = (uchar)result[i];
-
-   return CharArrayToString(
-      bytes,
-      0,
-      size,
-      CP_UTF8
-   );
+   return CharArrayToString(bytes, 0, size, CP_UTF8);
 }
 
-bool HttpPull(
-   const string url,
-   string &out
-)
+void ProcessSignalJson(string json);
+
+void ReadSignalSocket()
 {
-   ResetLastError();
+   if(!ConnectSignalSocket())
+      return;
 
-   char data[];
-   char result[];
-
-   ArrayResize(data, 0);
-
-   string headers = "";
-   string responseHeaders = "";
-
-   int status = WebRequest(
-      "GET",
-      url,
-      headers,
-      2000,
-      data,
-      result,
-      responseHeaders
-   );
-
-   int errorCode = GetLastError();
-
-   if(DEBUG_LOG)
+   if(!SocketIsConnected(g_socket))
    {
-      Log(
-         StringFormat(
-            "HTTP status=%d err=%d",
-            status,
-            errorCode
-         )
-      );
+      CloseSignalSocket("disconnected");
+      return;
    }
 
-   if(status != 200)
-      return false;
+   uint available = SocketIsReadable(g_socket);
 
-   out = HttpResultToString(result);
+   while(available > 0)
+   {
+      uchar bytes[];
+      int readCount = SocketRead(g_socket, bytes, available, 10);
 
-   return true;
+      if(readCount <= 0)
+      {
+         CloseSignalSocket("read failed");
+         return;
+      }
+
+      g_socket_buffer += BytesToUtf8(bytes, readCount);
+
+      if(StringLen(g_socket_buffer) > 1024 * 1024)
+      {
+         CloseSignalSocket("receive buffer overflow");
+         return;
+      }
+
+      available = SocketIsReadable(g_socket);
+   }
+
+   while(true)
+   {
+      int newline = StringFind(g_socket_buffer, "\n");
+
+      if(newline < 0)
+         break;
+
+      string line = Trim(StringSubstr(g_socket_buffer, 0, newline));
+      g_socket_buffer = StringSubstr(g_socket_buffer, newline + 1);
+
+      if(line == "")
+         continue;
+
+      if(line == "PING")
+      {
+         SendSocketLine("PONG");
+         continue;
+      }
+
+      if(line == "AUTH_OK" || line == "PONG")
+         continue;
+
+      if(line == "AUTH_FAILED")
+      {
+         Log("SOCKET AUTH FAILED: check SOCKET_TOKEN");
+         CloseSignalSocket("authentication failed");
+         return;
+      }
+
+      ProcessSignalJson(line);
+   }
+
+   datetime now = TimeLocal();
+
+   if(now - g_last_heartbeat >= 20)
+   {
+      if(SendSocketLine("PING"))
+         g_last_heartbeat = now;
+   }
 }
 
 //================ SIMPLE JSON PARSER =================//
@@ -798,13 +965,20 @@ int SetOpenPositionsToBreakEven(
 
    if(signalSymbol != "")
    {
-      resolvedSymbol =
-         ResolveSignalSymbol(signalSymbol);
+      string normalizedSignalSymbol = ToUpperCopy(Trim(signalSymbol));
+
+      if(normalizedSignalSymbol != "XAUUSD")
+      {
+         Log("SET BE FAILED: unsupported symbol " + signalSymbol);
+         return 0;
+      }
+
+      resolvedSymbol = g_trade_symbol;
 
       if(resolvedSymbol == "")
       {
          Log(
-            "SET BE FAILED: cannot resolve symbol " +
+            "SET BE FAILED: cached trade symbol is empty for " +
             signalSymbol
          );
 
@@ -817,10 +991,9 @@ int SetOpenPositionsToBreakEven(
 
    Log(
       StringFormat(
-         "SET BE START | positions=%d | filterSymbol=%s | magic=%I64d",
+         "SET BE START | positions=%d | filterSymbol=%s",
          totalPositions,
-         resolvedSymbol == "" ? "ALL" : resolvedSymbol,
-         MAGIC
+         resolvedSymbol == "" ? "ALL" : resolvedSymbol
       )
    );
 
@@ -874,30 +1047,44 @@ int SetOpenPositionsToBreakEven(
             SYMBOL_DIGITS
          );
 
+      
+      // Tính mức BE có cộng thêm phí
+      
+      if(positionType == POSITION_TYPE_BUY)
+      {
+         openPrice =
+            openPrice + BE_OFFSET_PRICE;
+      }
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         openPrice =
+            openPrice - BE_OFFSET_PRICE;
+      }
+      
       openPrice = NormalizeDouble(
          openPrice,
          digits
       );
 
-      MqlTick tick;
+      // Dùng giá hiện tại của chính position.
+      // Không dùng SymbolInfoTick() ở đây vì tick của symbol có thể bị stale
+      // sau khi đổi tài khoản / đổi symbol / terminal chưa refresh quote.
+      double currentPrice =
+         PositionGetDouble(POSITION_PRICE_CURRENT);
 
-      if(!SymbolInfoTick(positionSymbol, tick))
+      if(currentPrice <= 0.0)
       {
          Log(
             StringFormat(
-               "SET BE SKIP | ticket=%I64u | symbol=%s | no tick",
+               "SET BE SKIP | ticket=%I64u | symbol=%s | invalid POSITION_PRICE_CURRENT=%.5f",
                ticket,
-               positionSymbol
+               positionSymbol,
+               currentPrice
             )
          );
 
          continue;
       }
-
-      double currentPrice =
-         positionType == POSITION_TYPE_BUY
-         ? tick.bid
-         : tick.ask;
 
       // Đã ở BE rồi thì bỏ qua
       if(
@@ -1038,60 +1225,438 @@ int SetOpenPositionsToBreakEven(
    return modifiedCount;
 }
 
+//================ BULK SL / TP =================//
+
+bool IsSLValid(
+   const string symbol,
+   const ENUM_POSITION_TYPE positionType,
+   const double stopLoss,
+   const double currentPrice
+)
+{
+   if(stopLoss <= 0.0)
+      return false;
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   int stopsLevel = (int)SymbolInfoInteger(
+      symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   int freezeLevel = (int)SymbolInfoInteger(
+      symbol,
+      SYMBOL_TRADE_FREEZE_LEVEL
+   );
+
+   int requiredLevel = MathMax(
+      stopsLevel,
+      freezeLevel
+   );
+
+   double minimumDistance = requiredLevel * point;
+
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      // SL của BUY phải thấp hơn giá hiện tại của position
+      return stopLoss <= currentPrice - minimumDistance;
+   }
+
+   if(positionType == POSITION_TYPE_SELL)
+   {
+      // SL của SELL phải cao hơn giá hiện tại của position
+      return stopLoss >= currentPrice + minimumDistance;
+   }
+
+   return false;
+}
+
+bool IsTPValid(
+   const string symbol,
+   const ENUM_POSITION_TYPE positionType,
+   const double takeProfit,
+   const double currentPrice
+)
+{
+   if(takeProfit <= 0.0)
+      return false;
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   int stopsLevel = (int)SymbolInfoInteger(
+      symbol,
+      SYMBOL_TRADE_STOPS_LEVEL
+   );
+
+   int freezeLevel = (int)SymbolInfoInteger(
+      symbol,
+      SYMBOL_TRADE_FREEZE_LEVEL
+   );
+
+   int requiredLevel = MathMax(
+      stopsLevel,
+      freezeLevel
+   );
+
+   double minimumDistance = requiredLevel * point;
+
+   if(positionType == POSITION_TYPE_BUY)
+   {
+      // TP của BUY phải cao hơn giá hiện tại của position
+      return takeProfit >= currentPrice + minimumDistance;
+   }
+
+   if(positionType == POSITION_TYPE_SELL)
+   {
+      // TP của SELL phải thấp hơn giá hiện tại của position
+      return takeProfit <= currentPrice - minimumDistance;
+   }
+
+   return false;
+}
+
+int SetBulkPositionLevel(
+   const string signalSymbol,
+   const string commandType,
+   const double requestedPrice
+)
+{
+   string normalizedSignalSymbol = ToUpperCopy(Trim(signalSymbol));
+
+   if(normalizedSignalSymbol != "XAUUSD")
+   {
+      Log("BULK MODIFY FAILED | unsupported symbol=" + signalSymbol);
+      return 0;
+   }
+
+   string resolvedSymbol = g_trade_symbol;
+
+   if(resolvedSymbol == "")
+   {
+      Log(
+         "BULK MODIFY FAILED | cached trade symbol is empty for " +
+         signalSymbol
+      );
+
+      return 0;
+   }
+
+   string type = ToUpperCopy(
+      Trim(commandType)
+   );
+
+   if(
+      type != "SET_SL" &&
+      type != "SET_TP"
+   )
+   {
+      Log(
+         "BULK MODIFY FAILED | unsupported type=" +
+         type
+      );
+
+      return 0;
+   }
+
+   if(requestedPrice <= 0.0)
+   {
+      Log(
+         StringFormat(
+            "BULK MODIFY FAILED | invalid price=%.5f",
+            requestedPrice
+         )
+      );
+
+      return 0;
+   }
+
+   int modifiedCount = 0;
+   int totalPositions = PositionsTotal();
+
+   Log(
+      StringFormat(
+         "BULK MODIFY START | type=%s | symbol=%s | price=%.5f | positions=%d",
+         type,
+         resolvedSymbol,
+         requestedPrice,
+         totalPositions
+      )
+   );
+
+   for(int i = totalPositions - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string positionSymbol = PositionGetString(
+         POSITION_SYMBOL
+      );
+
+      if(positionSymbol != resolvedSymbol)
+         continue;
+
+      ENUM_POSITION_TYPE positionType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(
+            POSITION_TYPE
+         );
+
+      double currentSL = PositionGetDouble(
+         POSITION_SL
+      );
+
+      double currentTP = PositionGetDouble(
+         POSITION_TP
+      );
+
+      int digits = (int)SymbolInfoInteger(
+         positionSymbol,
+         SYMBOL_DIGITS
+      );
+
+      double newPrice = NormalizeDouble(
+         requestedPrice,
+         digits
+      );
+
+      double newSL = currentSL;
+      double newTP = currentTP;
+
+      // Dùng giá hiện tại của chính position cho SET_SL / SET_TP.
+      // Không dùng SymbolInfoTick() để tránh Bid/Ask stale.
+      double positionCurrent =
+         PositionGetDouble(POSITION_PRICE_CURRENT);
+
+      if(positionCurrent <= 0.0)
+      {
+         Log(
+            StringFormat(
+               "BULK MODIFY SKIP | ticket=%I64u | invalid POSITION_PRICE_CURRENT=%.5f",
+               ticket,
+               positionCurrent
+            )
+         );
+
+         continue;
+      }
+
+      if(type == "SET_SL")
+      {
+         if(
+            currentSL > 0.0 &&
+            MathAbs(currentSL - newPrice) <
+            SymbolInfoDouble(
+               positionSymbol,
+               SYMBOL_POINT
+            ) * 0.5
+         )
+         {
+            Log(
+               StringFormat(
+                  "SET SL SKIP | ticket=%I64u | already set | sl=%.*f",
+                  ticket,
+                  digits,
+                  currentSL
+               )
+            );
+
+            continue;
+         }
+
+         if(
+            !IsSLValid(
+               positionSymbol,
+               positionType,
+               newPrice,
+               positionCurrent
+            )
+         )
+         {
+            Log(
+               StringFormat(
+                  "SET SL SKIP | ticket=%I64u | invalid level | side=%s | requested=%.*f | current=%.*f",
+                  ticket,
+                  positionType == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                  digits,
+                  newPrice,
+                  digits,
+                  positionCurrent
+               )
+            );
+
+            continue;
+         }
+
+         newSL = newPrice;
+      }
+      else if(type == "SET_TP")
+      {
+         if(
+            currentTP > 0.0 &&
+            MathAbs(currentTP - newPrice) <
+            SymbolInfoDouble(
+               positionSymbol,
+               SYMBOL_POINT
+            ) * 0.5
+         )
+         {
+            Log(
+               StringFormat(
+                  "SET TP SKIP | ticket=%I64u | already set | tp=%.*f",
+                  ticket,
+                  digits,
+                  currentTP
+               )
+            );
+
+            continue;
+         }
+
+         if(
+            !IsTPValid(
+               positionSymbol,
+               positionType,
+               newPrice,
+               positionCurrent
+            )
+         )
+         {
+            Log(
+               StringFormat(
+                  "SET TP SKIP | ticket=%I64u | invalid level | side=%s | requested=%.*f | current=%.*f",
+                  ticket,
+                  positionType == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                  digits,
+                  newPrice,
+                  digits,
+                  positionCurrent
+               )
+            );
+
+            continue;
+         }
+
+         newTP = newPrice;
+      }
+
+      ResetLastError();
+
+      bool ok = trade.PositionModify(
+         ticket,
+         newSL,
+         newTP
+      );
+
+      uint retcode = trade.ResultRetcode();
+
+      if(
+         !ok ||
+         (
+            retcode != TRADE_RETCODE_DONE &&
+            retcode != TRADE_RETCODE_NO_CHANGES
+         )
+      )
+      {
+         Log(
+            StringFormat(
+               "BULK MODIFY FAIL | ticket=%I64u | type=%s | ret=%u | %s | error=%d",
+               ticket,
+               type,
+               retcode,
+               trade.ResultRetcodeDescription(),
+               GetLastError()
+            )
+         );
+
+         continue;
+      }
+
+      modifiedCount++;
+
+      Log(
+         StringFormat(
+            "BULK MODIFY OK | ticket=%I64u | symbol=%s | type=%s | sl=%.*f | tp=%.*f",
+            ticket,
+            positionSymbol,
+            type,
+            digits,
+            newSL,
+            digits,
+            newTP
+         )
+      );
+   }
+
+   Log(
+      StringFormat(
+         "BULK MODIFY FINISHED | type=%s | modified=%d",
+         type,
+         modifiedCount
+      )
+   );
+
+   return modifiedCount;
+}
+
 //================ INIT / DEINIT =================//
 
 int OnInit()
 {
-   if(POLL_SECONDS < 1)
+   if(SOCKET_PORT <= 0 || SOCKET_PORT > 65535)
    {
-      Print(
-         "POLL_SECONDS must be >= 1"
-      );
-
+      Print("SOCKET_PORT must be between 1 and 65535");
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   if(LIMIT_EXPIRY_HOURS < 0)
+   if(SOCKET_TIMER_MS < 20)
    {
-      Print(
-         "LIMIT_EXPIRY_HOURS must be >= 0"
-      );
+      Print("SOCKET_TIMER_MS must be >= 20");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
+   if(RECONNECT_SECONDS < 1)
+   {
+      Print("RECONNECT_SECONDS must be >= 1");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(LIMIT_EXPIRY_MINUTES < 0)
+   {
+      Print("LIMIT_EXPIRY_MINUTES must be >= 0");
       return INIT_PARAMETERS_INCORRECT;
    }
 
    trade.SetExpertMagicNumber(MAGIC);
 
-   g_last_login =
-      (long)AccountInfoInteger(
-         ACCOUNT_LOGIN
-      );
+   g_last_login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
+   g_trade_symbol = ResolveSignalSymbol("XAUUSD");
 
    EnsureChartSymbolAlive();
+   g_pending_chart_recovery = !IsUsableSymbol(Symbol());
 
    EventKillTimer();
 
-   if(!EventSetTimer(POLL_SECONDS))
+   if(!EventSetMillisecondTimer(SOCKET_TIMER_MS))
    {
-      Log(
-         StringFormat(
-            "EVENT TIMER FAILED | error=%d",
-            GetLastError()
-         )
-      );
-
+      Log(StringFormat("EVENT TIMER FAILED | error=%d", GetLastError()));
       return INIT_FAILED;
    }
 
    Log(
       StringFormat(
-         "INIT | login=%I64d | company=%s | server=%s | chartSymbol=%s",
+         "INIT SOCKET | login=%I64d | server=%s | chartSymbol=%s | tradeSymbol=%s",
          g_last_login,
-         AccountInfoString(ACCOUNT_COMPANY),
          AccountInfoString(ACCOUNT_SERVER),
-         Symbol()
+         Symbol(),
+         g_trade_symbol
       )
    );
+
+   ConnectSignalSocket();
 
    return INIT_SUCCEEDED;
 }
@@ -1099,55 +1664,45 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   CloseSignalSocket("EA deinit");
 
-   Log(
-      StringFormat(
-         "DEINIT | reason=%d",
-         reason
-      )
-   );
+   Log(StringFormat("DEINIT | reason=%d", reason));
 }
 
 //================ CHART EVENT =================//
+
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
 {
+   // Chỉ quan tâm khi trạng thái chart thay đổi.
+   if(id != CHARTEVENT_CHART_CHANGE)
+      return;
+
+   // M15 hoặc timeframe khác chỉ phát sinh event, nhưng symbol vẫn hợp lệ thì bỏ qua.
+   if(IsUsableSymbol(Symbol()))
+      return;
+
+   g_pending_chart_recovery = true;
    EnsureChartSymbolAlive();
-
-   EventKillTimer();
-   EventSetTimer(POLL_SECONDS);
-
-   g_last_poll = 0;
-
-   if(DEBUG_LOG)
-      Log(StringFormat("CHART EVENT id=%d -> rearm timer", id));
 }
 
 //================ TIMER =================//
+
 void OnTimer()
 {
-   datetime now = TimeCurrent();
-
-   if(now - g_last_poll < POLL_SECONDS)
-      return;
-
-   g_last_poll = now;
-
-   long login =
-      (long)AccountInfoInteger(
-         ACCOUNT_LOGIN
-      );
+   long login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
 
    if(login != g_last_login)
    {
       g_last_login = login;
-
       trade.SetExpertMagicNumber(MAGIC);
-
-      EnsureChartSymbolAlive();
+      g_trade_symbol = "";
+      g_pending_chart_recovery = true;
+      CloseSignalSocket("account changed");
+      g_last_connect_attempt = 0;
 
       Log(
          StringFormat(
-            "ACCOUNT CHANGED | login=%I64d | company=%s | server=%s | chartSymbol=%s",
+            "ACCOUNT CHANGED | login=%I64d | company=%s | server=%s | oldChartSymbol=%s",
             g_last_login,
             AccountInfoString(ACCOUNT_COMPANY),
             AccountInfoString(ACCOUNT_SERVER),
@@ -1155,15 +1710,38 @@ void OnTimer()
          )
       );
 
-      // Không pull ngay trong đúng vòng timer vừa đổi tài khoản.
       return;
    }
 
-   string json = "";
+   // Sau khi đổi tài khoản, terminal có thể cần vài vòng timer để tải symbol mới.
+   // Resolve được giới hạn bởi khóa 2 giây trong EnsureChartSymbolAlive().
+   if(g_pending_chart_recovery)
+   {
+      EnsureChartSymbolAlive();
 
-   if(!HttpPull(API, json))
-      return;
+      if(
+         IsUsableSymbol(g_trade_symbol) &&
+         IsUsableSymbol(Symbol()) &&
+         Symbol() == g_trade_symbol
+      )
+      {
+         g_pending_chart_recovery = false;
 
+         Log(
+            StringFormat(
+               "CHART RECOVERY COMPLETED | chartSymbol=%s | tradeSymbol=%s",
+               Symbol(),
+               g_trade_symbol
+            )
+         );
+      }
+   }
+
+   ReadSignalSocket();
+}
+
+void ProcessSignalJson(string json)
+{
    json = Trim(json);
 
    if(StringLen(json) < 2)
@@ -1218,27 +1796,76 @@ void OnTimer()
       return;
    }
 
-   string tradeSymbol =
-      ResolveSignalSymbol(symbol);
+   //================ SET SL HÀNG LOẠT =================//
 
-   if(tradeSymbol == "")
+   if(type == "SET_SL")
    {
+      double price = GetDouble(
+         json,
+         "price"
+      );
+
+      int modified = SetBulkPositionLevel(
+         symbol,
+         type,
+         price
+      );
+
       Log(
-         "SIGNAL SYMBOL NOT FOUND: " +
-         symbol
+         StringFormat(
+            "SET SL COMMAND COMPLETED | price=%.5f | modified=%d",
+            price,
+            modified
+         )
       );
 
       return;
    }
 
-   if(tradeSymbol != symbol)
+   //================ SET TP HÀNG LOẠT =================//
+
+   if(type == "SET_TP")
+   {
+      double price = GetDouble(
+         json,
+         "price"
+      );
+
+      int modified = SetBulkPositionLevel(
+         symbol,
+         type,
+         price
+      );
+
+      Log(
+         StringFormat(
+            "SET TP COMMAND COMPLETED | price=%.5f | modified=%d",
+            price,
+            modified
+         )
+      );
+
+      return;
+   }
+
+   string normalizedSignalSymbol = ToUpperCopy(Trim(symbol));
+
+   if(normalizedSignalSymbol != "XAUUSD")
+   {
+      Log("UNSUPPORTED SIGNAL SYMBOL: " + symbol);
+      return;
+   }
+
+   string tradeSymbol = g_trade_symbol;
+
+   if(tradeSymbol == "")
    {
       Log(
-         "SIGNAL SYMBOL RESOLVED: " +
-         symbol +
-         " -> " +
-         tradeSymbol
+         "CACHED TRADE SYMBOL IS EMPTY: " +
+         symbol
       );
+
+      return;
    }
 
    if(!SymbolSelect(tradeSymbol, true))
@@ -1277,11 +1904,11 @@ void OnTimer()
 
    datetime expiry = 0;
 
-   if(LIMIT_EXPIRY_HOURS > 0)
+   if(LIMIT_EXPIRY_MINUTES > 0)
    {
       expiry = (datetime)(
          TimeCurrent() +
-         (long)LIMIT_EXPIRY_HOURS * 3600
+         (long)LIMIT_EXPIRY_MINUTES * 60
       );
    }
 
@@ -1354,12 +1981,12 @@ void OnTimer()
       bool ok = false;
 
       ENUM_ORDER_TYPE_TIME timeType =
-         LIMIT_EXPIRY_HOURS > 0
+         LIMIT_EXPIRY_MINUTES > 0
          ? ORDER_TIME_SPECIFIED
          : ORDER_TIME_GTC;
 
       datetime expirationTime =
-         LIMIT_EXPIRY_HOURS > 0
+         LIMIT_EXPIRY_MINUTES > 0
          ? expiry
          : (datetime)0;
 
@@ -1470,7 +2097,7 @@ void OnTimer()
       else
       {
          string expiryText =
-            LIMIT_EXPIRY_HOURS > 0
+            LIMIT_EXPIRY_MINUTES > 0
             ? TimeToString(
                  expiry,
                  TIME_DATE | TIME_SECONDS

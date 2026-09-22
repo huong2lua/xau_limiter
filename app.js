@@ -58,6 +58,30 @@ const CONFIG = {
 };
 
 /* ============================================================
+   TP OVERRIDE (R MULTIPLE)
+
+   Mọi TP trong tín hiệu gốc sẽ bị ghi đè bằng
+   entry ± riskDistance * tpRMultiple.
+
+   Dùng `let` vì lệnh /tpr cho phép đổi runtime.
+============================================================ */
+
+const TP_R_MULTIPLE_DEFAULT = 3;
+
+let tpRMultiple = (() => {
+  const raw = Number(
+    process.env.TP_R_MULTIPLE ||
+      TP_R_MULTIPLE_DEFAULT
+  );
+
+  return Number.isFinite(raw) &&
+    raw > 0 &&
+    raw <= 20
+    ? raw
+    : TP_R_MULTIPLE_DEFAULT;
+})();
+
+/* ============================================================
    TELEGRAM CONFIG
 ============================================================ */
 
@@ -296,6 +320,68 @@ bot.on("channel_post", async (ctx) => {
 });
 
 /* ============================================================
+   APPLY R-MULTIPLE TP
+
+   Ghi đè TP gốc trong tín hiệu bằng bội số R.
+   Chạy SAU bước MERGE SAME ENTRY nên TP của lệnh
+   đã gộp cũng được tính lại từ entry + sl thật.
+============================================================ */
+
+function applyRMultipleTp(
+  signal,
+  rMultiple = tpRMultiple
+) {
+  if (
+    !signal ||
+    !Array.isArray(signal.orders)
+  ) {
+    return signal;
+  }
+
+  signal.tpRMultiple = rMultiple;
+
+  signal.orders = signal.orders.map(
+    (order) => {
+      const riskDistance =
+        Math.abs(
+          signal.sl - order.entry
+        );
+
+      /*
+       * SL == Entry hoặc dữ liệu hỏng
+       * => giữ nguyên TP gốc,
+       * không tạo TP trùng Entry.
+       */
+      if (
+        !Number.isFinite(
+          riskDistance
+        ) ||
+        riskDistance <= 0
+      ) {
+        return order;
+      }
+
+      const rawTp =
+        signal.type === "SELL_LIMIT"
+          ? order.entry -
+            riskDistance * rMultiple
+          : order.entry +
+            riskDistance * rMultiple;
+
+      return {
+        ...order,
+
+        tp: Number(
+          rawTp.toFixed(3)
+        ),
+      };
+    }
+  );
+
+  return signal;
+}
+
+/* ============================================================
    PARSE TRADE SIGNAL
 ============================================================ */
 
@@ -518,13 +604,15 @@ function parseOrderSignal(text) {
     ];
   }
 
-  return {
+  /* ---------------- TP = R MULTIPLE ---------------- */
+
+  return applyRMultipleTp({
     symbol,
     type,
     sl,
     orders,
     createdAt: Date.now(),
-  };
+  });
 }
 
 /* ============================================================
@@ -831,7 +919,12 @@ function getRTargets(
 }
 
 function formatSignal( signal, delivered ) {
+  const rLabel =
+    signal.tpRMultiple ??
+    tpRMultiple;
+
   let text = `📡 ${signal.symbol}`;
+  text += `, 🎯 TP=${rLabel}R`;
   text += `, 🖥 EA nhận: ${delivered}, `;
 
   text += signal.orders
@@ -899,6 +992,73 @@ bot.on("text", async (ctx) => {
       "clear"
     ) {
       await ctx.react("👍");
+
+      return;
+    }
+
+    /* ========================================================
+       TP R MULTIPLE
+
+       /tpr        -> xem hệ số hiện tại
+       /tpr 2      -> đổi sang 2R
+       /tpr 2.5    -> đổi sang 2.5R
+
+       Chỉ ảnh hưởng các tín hiệu gửi SAU lệnh này.
+    ======================================================== */
+
+    if (
+      normalizedText === "tpr" ||
+      normalizedText === "/tpr"
+    ) {
+      await ctx.reply(
+        `🎯 TP hiện tại: ${tpRMultiple}R\n` +
+          `Đổi bằng: /tpr <số>  (ví dụ /tpr 2)`
+      );
+
+      return;
+    }
+
+    const tprMatch =
+      normalizedText.match(
+        /^\/?tpr\s+(\d+(?:[.,]\d+)?)$/i
+      );
+
+    if (tprMatch) {
+      const value =
+        Number(
+          tprMatch[1].replace(
+            ",",
+            "."
+          )
+        );
+
+      if (
+        !Number.isFinite(
+          value
+        ) ||
+        value <= 0 ||
+        value > 20
+      ) {
+        await ctx.reply(
+          "Hệ số R không hợp lệ. Cho phép: 0 < R <= 20."
+        );
+
+        return;
+      }
+
+      const previous =
+        tpRMultiple;
+
+      tpRMultiple = value;
+
+      console.log(
+        `[TP] R multiple: ${previous} -> ${tpRMultiple}`
+      );
+
+      await ctx.reply(
+        `✅ TP mặc định: ${previous}R → ${tpRMultiple}R\n` +
+          `Áp dụng cho các tín hiệu gửi sau lệnh này.`
+      );
 
       return;
     }
@@ -1289,6 +1449,8 @@ app.get(
     res.json({
       ok: true,
 
+      tpRMultiple,
+
       connectedEA:
         connectedClients.filter(
           (client) =>
@@ -1351,6 +1513,10 @@ setInterval(() => {
 async function start() {
   console.log(
     "🚀 Starting combined app..."
+  );
+
+  console.log(
+    `🎯 TP override: ${tpRMultiple}R`
   );
 
   /* ---------------- GramJS ---------------- */

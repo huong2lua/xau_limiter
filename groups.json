@@ -3,8 +3,7 @@
   "defaultGroup": null,
   "groups": {
     "A": { "riskUsd": 25, "maxRiskUsd": 100 },
-    "B": { "riskUsd": 250, "maxRiskUsd": 1000 },
-    "C": { "riskUsd": 2500, "maxRiskUsd": 2500 }
+    "B": { "riskUsd": 250, "maxRiskUsd": 1000 }
   },
   "accounts": {
     "511163003@FTMO-Server": "A",

@@ -1,0 +1,16 @@
+{
+  "tpRMultiple": 3,
+  "defaultGroup": null,
+  "groups": {
+    "A": { "riskUsd": 25, "maxRiskUsd": 100 },
+    "B": { "riskUsd": 250, "maxRiskUsd": 1000 },
+    "C": { "riskUsd": 2500, "maxRiskUsd": 2500 }
+  },
+  "accounts": {
+    "511163003@FTMO-Server": "A",
+    "105599955@Exness-MT5Real15": "A",
+    "35896698@VantageMarkets-Live 15": "A",
+    "26224006@FivePercentOnline-Real": "A",
+    "26189881@FivePercentOnline-Real": "B"
+  }
+}

@@ -1001,6 +1001,7 @@ function formatSignal(signal, stats) {
    /ea                     (liệt kê EA đang kết nối)
    /reload                 (đọc lại groups.json)
    be [nhóm]
+   cancel [nhóm]           (EA hủy tất cả lệnh Buy/Sell Limit đang chờ)
    sl <giá> [nhóm]
    tp <giá> [nhóm]
    <tín hiệu> [| R A=40 B=400]
@@ -1181,6 +1182,28 @@ bot.on("text", async (ctx) => {
       await dispatchCommand(
         ctx,
         { symbol: "XAUUSD", type: "SET_BE", createdAt: Date.now() },
+        group
+      );
+      return;
+    }
+
+    /* ======================== HỦY LỆNH CHỜ ======================== */
+
+    const cancelMatch = normalizedText.match(
+      /^\/?(?:cancel|huy|hủy)(?:\s+([a-z0-9_]+))?$/
+    );
+
+    if (cancelMatch) {
+      const { group, error } = parseGroupArg(cancelMatch[1]);
+
+      if (error) {
+        await ctx.reply(error);
+        return;
+      }
+
+      await dispatchCommand(
+        ctx,
+        { symbol: "XAUUSD", type: "CANCEL_PENDING", createdAt: Date.now() },
         group
       );
       return;
